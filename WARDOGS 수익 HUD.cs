@@ -1,0 +1,1233 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Text;
+using System.Globalization;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Windows.Forms;
+using Microsoft.Win32;
+
+namespace WardogsProfitHudApp
+{
+    static class Program
+    {
+        [DllImport("user32.dll")]
+        private static extern bool SetProcessDPIAware();
+
+        [STAThread]
+        static void Main()
+        {
+            // 기존에 백그라운드에 켜져 있던 동일 프로세스가 있다면 자동 정리 후 항상 새 창 기동
+            try
+            {
+                Process current = Process.GetCurrentProcess();
+                foreach (Process p in Process.GetProcessesByName(current.ProcessName))
+                {
+                    if (p.Id != current.Id)
+                    {
+                        try { p.Kill(); } catch { }
+                    }
+                }
+            }
+            catch { }
+
+            AppDomain.CurrentDomain.UnhandledException += (s, e) => {
+                try { File.WriteAllText(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "hud_crash.txt"), e.ExceptionObject.ToString()); } catch { }
+            };
+            Application.ThreadException += (s, e) => {
+                try { File.WriteAllText(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "hud_crash.txt"), e.Exception.ToString()); } catch { }
+            };
+            try { SetProcessDPIAware(); } catch { }
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            try
+            {
+                Application.Run(new MainHudControlForm());
+            }
+            catch (Exception ex)
+            {
+                File.WriteAllText(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "hud_crash.txt"), ex.ToString());
+            }
+        }
+    }
+
+    // ==================== 스팀 실시간 내 매치 순손익 타임스탬프 직통 리더 ====================
+    public class SteamDirectProfitReader : IDisposable
+    {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, [Out] byte[] lpBuffer, int dwSize, out IntPtr lpNumberOfBytesRead);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern int VirtualQueryEx(IntPtr hProcess, IntPtr lpAddress, out MEMORY_BASIC_INFORMATION lpBuffer, int dwLength);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MEMORY_BASIC_INFORMATION
+        {
+            public IntPtr BaseAddress;
+            public IntPtr AllocationBase;
+            public uint AllocationProtect;
+            public ushort PartitionId;
+            public IntPtr RegionSize;
+            public uint State;
+            public uint Protect;
+            public uint Type;
+        }
+
+        private const uint PROCESS_VM_READ = 0x0010;
+        private const uint PROCESS_QUERY_INFORMATION = 0x0400;
+
+        private readonly object syncLock = new object();
+        private Thread bgWorker;
+        private volatile bool isRunning = true;
+
+        private string curVal = "";
+        private string curState = "";
+        private string curFaction = "";
+        private string curGame = "";
+        private ulong curTs = 0;
+        private bool hasData = false;
+
+        public bool IsSteamRunning { get; private set; }
+        public bool IsWardogsRunning { get; private set; }
+
+        public SteamDirectProfitReader()
+        {
+            bgWorker = new Thread(WorkerLoop)
+            {
+                IsBackground = true,
+                Name = "SteamProfitReaderWorker"
+            };
+            bgWorker.Start();
+        }
+
+        public bool Poll(out string profitLossStr, out string stateStr, out string factionStr, out string gameStateStr, out ulong timestamp)
+        {
+            lock (syncLock)
+            {
+                profitLossStr = curVal;
+                stateStr = curState;
+                factionStr = curFaction;
+                gameStateStr = curGame;
+                timestamp = curTs;
+                return hasData;
+            }
+        }
+
+        private void WorkerLoop()
+        {
+            int steamPid = 0;
+            ulong steamId64 = 0UL;
+            IntPtr hHelper = IntPtr.Zero;
+            int helperPid = 0;
+
+            byte[] userBytes = new byte[8];
+            byte[] appBytes = BitConverter.GetBytes(1867240UL);
+            byte[] pageBuf = new byte[1024 * 1024];
+
+            long cachedAddr = 0;
+            ulong maxObservedTs = 0;
+            DateTime lastFullScan = DateTime.MinValue;
+
+            while (isRunning)
+            {
+                try
+                {
+                    CheckProcesses(out steamPid, ref steamId64);
+
+                    if (!IsSteamRunning || steamId64 == 0UL)
+                    {
+                        if (hHelper != IntPtr.Zero) { CloseHandle(hHelper); hHelper = IntPtr.Zero; helperPid = 0; }
+                        cachedAddr = 0;
+                        lock (syncLock) { hasData = false; }
+                        Thread.Sleep(1000);
+                        continue;
+                    }
+
+                    Buffer.BlockCopy(BitConverter.GetBytes(steamId64), 0, userBytes, 0, 8);
+
+                    // 최적의 steamwebhelper 렌더러 연결
+                    Process bestHelper = FindTargetRenderer();
+                    if (bestHelper == null)
+                    {
+                        Thread.Sleep(500);
+                        continue;
+                    }
+
+                    if (bestHelper.Id != helperPid || hHelper == IntPtr.Zero)
+                    {
+                        if (hHelper != IntPtr.Zero) CloseHandle(hHelper);
+                        helperPid = bestHelper.Id;
+                        hHelper = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, helperPid);
+                        cachedAddr = 0;
+                    }
+
+                    if (hHelper == IntPtr.Zero)
+                    {
+                        Thread.Sleep(500);
+                        continue;
+                    }
+
+                    ulong localMaxTs = maxObservedTs;
+                    string bestVal = "";
+                    string bestState = "";
+                    string bestGame = "";
+                    string bestFaction = "";
+                    long bestFoundAddr = 0;
+
+                    // 1. 캐시된 주소 주변 16MB 고속 스캔 (약 5~8ms 소요)
+                    if (cachedAddr != 0)
+                    {
+                        long start = Math.Max(0, cachedAddr - (8 * 1024 * 1024));
+                        long end = cachedAddr + (8 * 1024 * 1024);
+                        ScanRange(hHelper, start, end, userBytes, appBytes, pageBuf,
+                            ref localMaxTs, ref bestVal, ref bestState, ref bestGame, ref bestFaction, ref bestFoundAddr);
+                    }
+
+                    // 2. 캐시가 없거나 2초 이상 새 패킷이 없는 경우 전체 메모리 풀 스윕
+                    if (bestFoundAddr == 0 || (DateTime.UtcNow - lastFullScan).TotalSeconds > 2.0)
+                    {
+                        ScanRange(hHelper, 0, 0x7FFFFFFF0000L, userBytes, appBytes, pageBuf,
+                            ref localMaxTs, ref bestVal, ref bestState, ref bestGame, ref bestFaction, ref bestFoundAddr);
+                        lastFullScan = DateTime.UtcNow;
+                    }
+
+                    if (bestFoundAddr != 0 && !string.IsNullOrEmpty(bestVal))
+                    {
+                        cachedAddr = bestFoundAddr;
+                        maxObservedTs = localMaxTs;
+                        lock (syncLock)
+                        {
+                            curVal = bestVal;
+                            curState = bestState;
+                            curGame = bestGame;
+                            curFaction = bestFaction;
+                            curTs = localMaxTs;
+                            hasData = true;
+                        }
+                    }
+                }
+                catch { }
+
+                Thread.Sleep(150);
+            }
+
+            if (hHelper != IntPtr.Zero) CloseHandle(hHelper);
+        }
+
+        private void CheckProcesses(out int steamPid, ref ulong steamId64)
+        {
+            steamPid = 0;
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam\ActiveProcess"))
+                {
+                    if (key != null)
+                    {
+                        steamPid = Convert.ToInt32(key.GetValue("pid", 0));
+                        uint activeUser = Convert.ToUInt32(key.GetValue("ActiveUser", 0));
+                        if (activeUser != 0) steamId64 = 76561197960265728UL + activeUser;
+                    }
+                }
+            }
+            catch { }
+
+            IsSteamRunning = steamPid != 0 && Process.GetProcessesByName("steam").Length > 0;
+
+            bool wardogsFound = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Length > 0;
+            if (!wardogsFound)
+            {
+                try
+                {
+                    using (RegistryKey appKey = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam\Apps\1867240"))
+                    {
+                        if (appKey != null && Convert.ToInt32(appKey.GetValue("Running", 0)) == 1)
+                            wardogsFound = true;
+                    }
+                }
+                catch { }
+            }
+            IsWardogsRunning = wardogsFound;
+        }
+
+        private Process FindTargetRenderer()
+        {
+            Process[] procs = Process.GetProcessesByName("steamwebhelper");
+            if (procs == null || procs.Length == 0) return null;
+            Array.Sort(procs, (a, b) => b.WorkingSet64.CompareTo(a.WorkingSet64));
+            return procs[0];
+        }
+
+        private void ScanRange(IntPtr hProc, long startAddr, long endAddr, byte[] userBytes, byte[] appBytes, byte[] pageBuf,
+            ref ulong maxTs, ref string bestVal, ref string bestState, ref string bestGame, ref string bestFaction, ref long bestAddr)
+        {
+            long addr = startAddr;
+            byte[] needleTs = new byte[] { 0xe8, 0x02 };
+
+            while (addr < endAddr && isRunning)
+            {
+                MEMORY_BASIC_INFORMATION mbi;
+                if (VirtualQueryEx(hProc, (IntPtr)addr, out mbi, Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION))) == 0) break;
+                long baseAddr = (long)mbi.BaseAddress;
+                long size = (long)mbi.RegionSize;
+                if (baseAddr == 0) baseAddr = addr;
+
+                if (mbi.State == 0x1000 && (mbi.Protect & 0x04) != 0 && (mbi.Protect & 0x100) == 0)
+                {
+                    long curOffset = 0;
+                    while (curOffset < size && isRunning)
+                    {
+                        int toRead = (int)Math.Min((long)pageBuf.Length, size - curOffset);
+                        IntPtr nRead;
+                        if (ReadProcessMemory(hProc, (IntPtr)(baseAddr + curOffset), pageBuf, toRead, out nRead))
+                        {
+                            int bytesRead = (int)nRead;
+                            int idx = 0;
+                            while (idx <= bytesRead - 8)
+                            {
+                                if (MatchAt(pageBuf, idx, userBytes, 8))
+                                {
+                                    int chunkLen = Math.Min(bytesRead - idx, 600);
+                                    if (chunkLen > 100)
+                                    {
+                                        int appIdx = FindBytesSub(pageBuf, idx, chunkLen, appBytes, 0, 8);
+                                        if (appIdx != -1)
+                                        {
+                                            int pLossIdx = FindAscii(pageBuf, idx, chunkLen, "profit_loss");
+                                            if (pLossIdx != -1)
+                                            {
+                                                int tsIdx = FindBytesSub(pageBuf, idx, chunkLen, needleTs, 0, 2);
+                                                ulong ts = 0;
+                                                if (tsIdx != -1)
+                                                {
+                                                    ts = DecodeVarint(pageBuf, tsIdx + 2, idx + chunkLen);
+                                                }
+
+                                                if (ts >= maxTs)
+                                                {
+                                                    string chunk = Encoding.ASCII.GetString(pageBuf, idx, chunkLen);
+                                                    Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
+                                                    if (m.Success)
+                                                    {
+                                                        maxTs = ts;
+                                                        bestVal = m.Groups[1].Value.Trim();
+                                                        bestAddr = baseAddr + curOffset + idx;
+
+                                                        Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+                                                        if (ms.Success) bestState = ms.Groups[1].Value.ToLowerInvariant();
+
+                                                        Match mg = Regex.Match(chunk, @"game_state[^\w]*(\w+)", RegexOptions.IgnoreCase);
+                                                        if (mg.Success) bestGame = mg.Groups[1].Value.ToLowerInvariant();
+
+                                                        Match mf = Regex.Match(chunk, @"faction[^\w]*(charlie|bravo|alpha)", RegexOptions.IgnoreCase);
+                                                        if (mf.Success) bestFaction = mf.Groups[1].Value.ToLowerInvariant();
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    idx += 8;
+                                }
+                                else
+                                {
+                                    idx++;
+                                }
+                            }
+                        }
+                        curOffset += toRead;
+                    }
+                }
+                addr = baseAddr + size;
+            }
+        }
+
+        private static ulong DecodeVarint(byte[] buf, int offset, int maxOffset)
+        {
+            ulong val = 0;
+            int shift = 0;
+            for (int i = 0; i < 10; i++)
+            {
+                if (offset + i >= maxOffset) break;
+                byte b = buf[offset + i];
+                val |= ((ulong)(b & 0x7F)) << shift;
+                shift += 7;
+                if ((b & 0x80) == 0) return val;
+            }
+            return 0;
+        }
+
+        private static int FindAscii(byte[] buf, int start, int count, string text)
+        {
+            byte[] needle = Encoding.ASCII.GetBytes(text);
+            return FindBytesSub(buf, start, count, needle, 0, needle.Length);
+        }
+
+        private static int FindBytesSub(byte[] src, int startIdx, int count, byte[] needle, int needleStart, int needleLen)
+        {
+            int max = Math.Min(src.Length, startIdx + count) - needleLen;
+            for (int i = startIdx; i <= max; i++)
+            {
+                bool ok = true;
+                for (int j = 0; j < needleLen; j++)
+                {
+                    if (src[i + j] != needle[needleStart + j]) { ok = false; break; }
+                }
+                if (ok) return i;
+            }
+            return -1;
+        }
+
+        private static bool MatchAt(byte[] src, int offset, byte[] needle, int len)
+        {
+            for (int i = 0; i < len; i++)
+            {
+                if (src[offset + i] != needle[i]) return false;
+            }
+            return true;
+        }
+
+        public void Dispose()
+        {
+            isRunning = false;
+        }
+    }
+
+    // ==================== 메인 컨트롤 폼 ====================
+    public class MainHudControlForm : Form
+    {
+        [DllImport("user32.dll")]
+        private static extern short GetAsyncKeyState(int vKey);
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
+        private const int VK_F7 = 0x76;
+        private const int VK_F8 = 0x77;
+
+        private const string RegistryKeyPath = @"Software\WardogsProfitHud";
+
+        private SteamDirectProfitReader steamReader;
+        private ProfitHudOverlayForm hudOverlay;
+        private System.Windows.Forms.Timer pollTimer;
+        private Thread hotkeyThread;
+        private volatile bool isRunning = true;
+
+        private bool isHudVisible = true;
+        private bool isClickThrough = false;
+        private bool showHudBox = true;
+        private int hudFontSize = 16;
+        private int hudOpacityPercent = 90;
+        private Point hudPosition = new Point(30, 30);
+
+        private bool hasLastAmount = false;
+        private long lastAmountValue = 0;
+        private long lastDeltaValue = 0;
+        private DateTime lastDeltaTime = DateTime.MinValue;
+
+        private Button btnToggleHud;
+        private Button btnToggleLock;
+        private NumericUpDown numFontSize, numOpacity;
+        private CheckBox chkShowBox;
+        private CheckBox chkControlTopMost;
+        private Label lblSteamStatus;
+        private Label lblLiveValuePreview;
+        private bool suppressEvents = false;
+
+        public MainHudControlForm()
+        {
+            this.Text = "WARDOGS 수익 HUD";
+            try
+            {
+                Icon exeIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+                if (exeIcon != null) this.Icon = exeIcon;
+            }
+            catch { }
+            this.FormBorderStyle = FormBorderStyle.FixedSingle;
+            this.MaximizeBox = false;
+            this.ClientSize = new Size(320, 268);
+            this.StartPosition = FormStartPosition.CenterScreen;
+            this.BackColor = Color.FromArgb(12, 12, 14);
+            this.ForeColor = Color.FromArgb(168, 174, 184);
+            this.Font = new Font("맑은 고딕", 9f, FontStyle.Regular);
+
+            hudOverlay = new ProfitHudOverlayForm();
+            hudOverlay.PositionChangedByDrag += (newPos) =>
+            {
+                hudPosition = newPos;
+                SaveSettings();
+            };
+            hudOverlay.FontSizeChangedByWheel += (delta) =>
+            {
+                if (numFontSize != null)
+                {
+                    int next = (int)numFontSize.Value + delta;
+                    numFontSize.Value = Math.Max(numFontSize.Minimum, Math.Min(numFontSize.Maximum, next));
+                }
+            };
+
+            BuildUI();
+            LoadSettings();
+            ApplySettingsToHud();
+
+            steamReader = new SteamDirectProfitReader();
+
+            pollTimer = new System.Windows.Forms.Timer();
+            pollTimer.Interval = 200;
+            pollTimer.Tick += PollTimer_Tick;
+            pollTimer.Start();
+
+            hotkeyThread = new Thread(HotkeyLoop) { IsBackground = true };
+            hotkeyThread.Start();
+
+            PollTimer_Tick(null, EventArgs.Empty);
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            this.BringToFront();
+            this.Activate();
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            try
+            {
+                int useDark = 1;
+                if (DwmSetWindowAttribute(this.Handle, 20, ref useDark, sizeof(int)) != 0)
+                {
+                    DwmSetWindowAttribute(this.Handle, 19, ref useDark, sizeof(int));
+                }
+            }
+            catch { }
+        }
+
+        private void BuildUI()
+        {
+            GroupBox grpStatus = new GroupBox()
+            {
+                Text = "스팀 실시간 연동 상태",
+                Font = new Font("맑은 고딕", 9f, FontStyle.Bold),
+                Location = new Point(14, 10),
+                Size = new Size(292, 102),
+                ForeColor = Color.FromArgb(158, 164, 174)
+            };
+
+            lblSteamStatus = new Label()
+            {
+                Text = "스팀 프로세스 연동 중...",
+                Location = new Point(12, 22),
+                Size = new Size(268, 18),
+                Font = new Font("맑은 고딕", 8.5f, FontStyle.Regular),
+                ForeColor = Color.FromArgb(140, 195, 255)
+            };
+
+            Panel pnlPreview = new Panel()
+            {
+                Location = new Point(12, 44),
+                Size = new Size(268, 46),
+                BackColor = Color.FromArgb(18, 18, 22),
+                BorderStyle = BorderStyle.FixedSingle
+            };
+
+            lblLiveValuePreview = new Label()
+            {
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleCenter,
+                Font = new Font("맑은 고딕", 13f, FontStyle.Bold),
+                Text = "실시간 순손익 수집 중...",
+                ForeColor = Color.FromArgb(200, 206, 216)
+            };
+            pnlPreview.Controls.Add(lblLiveValuePreview);
+
+            grpStatus.Controls.AddRange(new Control[] { lblSteamStatus, pnlPreview });
+
+            GroupBox grpControls = new GroupBox()
+            {
+                Text = "HUD 오버레이 설정 (F7: 표시 / F8: 위치잠금)",
+                Font = new Font("맑은 고딕", 9f, FontStyle.Bold),
+                Location = new Point(14, 118),
+                Size = new Size(292, 138),
+                ForeColor = Color.FromArgb(158, 164, 174)
+            };
+
+            btnToggleHud = new Button()
+            {
+                Text = "HUD 켜짐",
+                Location = new Point(12, 24),
+                Size = new Size(130, 36),
+                Font = new Font("맑은 고딕", 9.5f, FontStyle.Bold),
+                FlatStyle = FlatStyle.Flat,
+                TextAlign = ContentAlignment.MiddleCenter,
+                BackColor = Color.FromArgb(24, 64, 38),
+                ForeColor = Color.FromArgb(168, 225, 184)
+            };
+            btnToggleHud.FlatAppearance.BorderColor = Color.FromArgb(48, 120, 72);
+            btnToggleHud.Click += (s, e) => ToggleHudVisible();
+
+            btnToggleLock = new Button()
+            {
+                Text = "마우스 이동 가능",
+                Location = new Point(150, 24),
+                Size = new Size(130, 36),
+                Font = new Font("맑은 고딕", 9.5f, FontStyle.Bold),
+                FlatStyle = FlatStyle.Flat,
+                TextAlign = ContentAlignment.MiddleCenter,
+                BackColor = Color.FromArgb(22, 22, 26),
+                ForeColor = Color.FromArgb(172, 178, 188)
+            };
+            btnToggleLock.FlatAppearance.BorderColor = Color.FromArgb(46, 48, 54);
+            btnToggleLock.Click += (s, e) => ToggleClickThrough();
+
+            Label lblFont = new Label() { Text = "글자크기:", Location = new Point(14, 72), AutoSize = true, Font = new Font("맑은 고딕", 9f), ForeColor = Color.FromArgb(155, 160, 170) };
+            numFontSize = CreateNum(76, 69, 8, 60, 16, 1);
+            numFontSize.ValueChanged += (s, e) => { if (!suppressEvents) { hudFontSize = (int)numFontSize.Value; ApplySettingsToHud(); SaveSettings(); } };
+            numFontSize.MouseWheel += (s, e) => {
+                ((HandledMouseEventArgs)e).Handled = true;
+                int delta = e.Delta > 0 ? 1 : -1;
+                int next = (int)numFontSize.Value + delta;
+                numFontSize.Value = Math.Max(numFontSize.Minimum, Math.Min(numFontSize.Maximum, next));
+            };
+
+            Label lblOpacity = new Label() { Text = "불투명도(%):", Location = new Point(146, 72), AutoSize = true, Font = new Font("맑은 고딕", 9f), ForeColor = Color.FromArgb(155, 160, 170) };
+            numOpacity = CreateNum(226, 69, 15, 100, 90, 5);
+            numOpacity.ValueChanged += (s, e) => { if (!suppressEvents) { hudOpacityPercent = (int)numOpacity.Value; ApplySettingsToHud(); SaveSettings(); } };
+            numOpacity.MouseWheel += (s, e) => {
+                ((HandledMouseEventArgs)e).Handled = true;
+                int delta = e.Delta > 0 ? 5 : -5;
+                int next = (int)numOpacity.Value + delta;
+                numOpacity.Value = Math.Max(numOpacity.Minimum, Math.Min(numOpacity.Maximum, next));
+            };
+
+            chkShowBox = new CheckBox()
+            {
+                Text = "어두운 배경 박스",
+                Location = new Point(14, 104),
+                AutoSize = true,
+                Font = new Font("맑은 고딕", 9f),
+                ForeColor = Color.FromArgb(162, 168, 178),
+                Checked = true
+            };
+            chkShowBox.CheckedChanged += (s, e) => { if (!suppressEvents) { showHudBox = chkShowBox.Checked; ApplySettingsToHud(); SaveSettings(); } };
+
+            chkControlTopMost = new CheckBox()
+            {
+                Text = "창 항상 위",
+                Location = new Point(164, 104),
+                AutoSize = true,
+                Font = new Font("맑은 고딕", 9f),
+                ForeColor = Color.FromArgb(162, 168, 178),
+                Checked = true
+            };
+            chkControlTopMost.CheckedChanged += (s, e) => { this.TopMost = chkControlTopMost.Checked; if (!suppressEvents) SaveSettings(); };
+
+            grpControls.Controls.AddRange(new Control[]
+            {
+                btnToggleHud, btnToggleLock,
+                lblFont, numFontSize, lblOpacity, numOpacity,
+                chkShowBox, chkControlTopMost
+            });
+
+            this.Controls.Add(grpStatus);
+            this.Controls.Add(grpControls);
+            this.TopMost = chkControlTopMost.Checked;
+        }
+
+        private NumericUpDown CreateNum(int x, int y, int min, int max, int val, int increment)
+        {
+            NumericUpDown num = new NumericUpDown()
+            {
+                Location = new Point(x, y),
+                Size = new Size(54, 23),
+                Font = new Font("맑은 고딕", 9f),
+                Minimum = min,
+                Maximum = max,
+                Value = val,
+                Increment = increment,
+                DecimalPlaces = 0,
+                BackColor = Color.FromArgb(20, 20, 24),
+                ForeColor = Color.FromArgb(185, 192, 202),
+                BorderStyle = BorderStyle.FixedSingle,
+                TextAlign = HorizontalAlignment.Center
+            };
+            return num;
+        }
+
+        private void ToggleHudVisible()
+        {
+            isHudVisible = !isHudVisible;
+            ApplySettingsToHud();
+            SaveSettings();
+        }
+
+        private void ToggleClickThrough()
+        {
+            isClickThrough = !isClickThrough;
+            ApplySettingsToHud();
+            SaveSettings();
+        }
+
+        private void ApplySettingsToHud()
+        {
+            if (isHudVisible)
+            {
+                btnToggleHud.Text = "HUD 켜짐";
+                btnToggleHud.BackColor = Color.FromArgb(24, 64, 38);
+                btnToggleHud.ForeColor = Color.FromArgb(168, 225, 184);
+                btnToggleHud.FlatAppearance.BorderColor = Color.FromArgb(48, 120, 72);
+            }
+            else
+            {
+                btnToggleHud.Text = "HUD 꺼짐";
+                btnToggleHud.BackColor = Color.FromArgb(22, 22, 26);
+                btnToggleHud.ForeColor = Color.FromArgb(148, 154, 164);
+                btnToggleHud.FlatAppearance.BorderColor = Color.FromArgb(46, 48, 54);
+            }
+
+            if (isClickThrough)
+            {
+                btnToggleLock.Text = "위치 잠금 (투과)";
+                btnToggleLock.BackColor = Color.FromArgb(62, 42, 18);
+                btnToggleLock.ForeColor = Color.FromArgb(245, 200, 125);
+                btnToggleLock.FlatAppearance.BorderColor = Color.FromArgb(130, 90, 36);
+            }
+            else
+            {
+                btnToggleLock.Text = "마우스 이동 가능";
+                btnToggleLock.BackColor = Color.FromArgb(22, 22, 26);
+                btnToggleLock.ForeColor = Color.FromArgb(172, 178, 188);
+                btnToggleLock.FlatAppearance.BorderColor = Color.FromArgb(46, 48, 54);
+            }
+
+            hudOverlay.ConfigureHud(hudPosition, hudFontSize, hudOpacityPercent, showHudBox, isClickThrough, isHudVisible);
+        }
+
+        private void HotkeyLoop()
+        {
+            bool f7Prev = false;
+            bool f8Prev = false;
+
+            while (isRunning)
+            {
+                bool f7Down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+                bool f8Down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+
+                if (f7Down && !f7Prev)
+                {
+                    if (!IsDisposed && IsHandleCreated)
+                        this.BeginInvoke((Action)ToggleHudVisible);
+                }
+                if (f8Down && !f8Prev)
+                {
+                    if (!IsDisposed && IsHandleCreated)
+                        this.BeginInvoke((Action)ToggleClickThrough);
+                }
+
+                f7Prev = f7Down;
+                f8Prev = f8Down;
+                Thread.Sleep(25);
+            }
+        }
+
+        private void PollTimer_Tick(object sender, EventArgs e)
+        {
+            string profitLoss;
+            string state;
+            string faction;
+            string gameState;
+            ulong ts;
+
+            bool found = steamReader.Poll(out profitLoss, out state, out faction, out gameState, out ts);
+
+            if (steamReader.IsSteamRunning)
+            {
+                lblSteamStatus.Text = steamReader.IsWardogsRunning
+                    ? "스팀 연동: WARDOGS 실행 중"
+                    : "스팀 연동: 게임 대기 중";
+                lblSteamStatus.ForeColor = steamReader.IsWardogsRunning
+                    ? Color.FromArgb(110, 230, 155)
+                    : Color.FromArgb(140, 195, 255);
+            }
+            else
+            {
+                lblSteamStatus.Text = "스팀 클라이언트를 찾을 수 없습니다.";
+                lblSteamStatus.ForeColor = Color.FromArgb(235, 110, 110);
+            }
+
+            string displayText;
+            int sign = 0;
+
+            if (found && !string.IsNullOrEmpty(profitLoss))
+            {
+                if (state == "loss" || profitLoss.Contains("-"))
+                {
+                    sign = -1;
+                    displayText = profitLoss + " 손실";
+                }
+                else if (state == "profit" || profitLoss.Contains("+") || (!profitLoss.Contains("-") && profitLoss != "$0"))
+                {
+                    sign = 1;
+                    string formatted = profitLoss.StartsWith("+") ? profitLoss : ("+" + profitLoss);
+                    displayText = formatted + " 수익";
+                }
+                else
+                {
+                    sign = 0;
+                    displayText = profitLoss + " (본전)";
+                }
+            }
+            else
+            {
+                if (steamReader.IsWardogsRunning)
+                {
+                    displayText = "WARDOGS: 로비 / 매치 대기 중";
+                }
+                else
+                {
+                    displayText = "WARDOGS 대기 중";
+                }
+                sign = 0;
+            }
+
+            string deltaText = "";
+            long parsedAmount;
+            if (TryExtractSignedAmount(profitLoss, sign, out parsedAmount))
+            {
+                if (hasLastAmount && parsedAmount != lastAmountValue)
+                {
+                    lastDeltaValue = parsedAmount - lastAmountValue;
+                    lastDeltaTime = DateTime.UtcNow;
+                }
+                lastAmountValue = parsedAmount;
+                hasLastAmount = true;
+            }
+
+            if ((DateTime.UtcNow - lastDeltaTime).TotalSeconds <= 8.0 && lastDeltaValue != 0)
+            {
+                deltaText = lastDeltaValue > 0
+                    ? string.Format("(+${0:N0})", lastDeltaValue)
+                    : string.Format("(-${0:N0})", Math.Abs(lastDeltaValue));
+            }
+
+            UpdateHudDisplay(displayText, deltaText, sign);
+        }
+
+        private static bool TryExtractSignedAmount(string text, int sign, out long amount)
+        {
+            amount = 0;
+            if (string.IsNullOrEmpty(text)) return false;
+
+            Match m = Regex.Match(text, @"([\+\-])?\s*\$?\s*([\d,]+)");
+            if (!m.Success) return false;
+
+            string numStr = m.Groups[2].Value.Replace(",", "");
+            long parsed;
+            if (!long.TryParse(numStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed))
+                return false;
+
+            if (m.Groups[1].Value == "-" || sign < 0)
+                amount = -parsed;
+            else
+                amount = parsed;
+
+            return true;
+        }
+
+        private void UpdateHudDisplay(string mainText, string deltaText, int sign)
+        {
+            lblLiveValuePreview.Text = string.IsNullOrEmpty(deltaText) ? mainText : (mainText + "  " + deltaText);
+
+            if (sign > 0)
+            {
+                lblLiveValuePreview.ForeColor = Color.FromArgb(46, 230, 118);
+            }
+            else if (sign < 0)
+            {
+                lblLiveValuePreview.ForeColor = Color.FromArgb(255, 85, 85);
+            }
+            else
+            {
+                lblLiveValuePreview.ForeColor = Color.FromArgb(205, 212, 222);
+            }
+
+            hudOverlay.UpdateContent(mainText, deltaText, sign);
+        }
+
+        private void LoadSettings()
+        {
+            suppressEvents = true;
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegistryKeyPath))
+                {
+                    if (key != null)
+                    {
+                        hudPosition.X = unchecked((int)Convert.ToInt64(key.GetValue("X", 30)));
+                        hudPosition.Y = unchecked((int)Convert.ToInt64(key.GetValue("Y", 30)));
+                        hudFontSize = Math.Max(8, Math.Min(60, Convert.ToInt32(key.GetValue("FontSize", 16))));
+                        hudOpacityPercent = Math.Max(15, Math.Min(100, Convert.ToInt32(key.GetValue("Opacity", 90))));
+                        showHudBox = Convert.ToInt32(key.GetValue("ShowBox", 1)) != 0;
+                        isClickThrough = Convert.ToInt32(key.GetValue("ClickThrough", 0)) != 0;
+                        isHudVisible = Convert.ToInt32(key.GetValue("HudVisible", 1)) != 0;
+                        bool topMost = Convert.ToInt32(key.GetValue("ControlTopMost", 1)) != 0;
+
+                        numFontSize.Value = hudFontSize;
+                        numOpacity.Value = hudOpacityPercent;
+                        chkShowBox.Checked = showHudBox;
+                        chkControlTopMost.Checked = topMost;
+                        this.TopMost = topMost;
+                    }
+                }
+            }
+            catch { }
+            suppressEvents = false;
+        }
+
+        private void SaveSettings()
+        {
+            if (suppressEvents) return;
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegistryKeyPath))
+                {
+                    if (key != null)
+                    {
+                        key.SetValue("X", hudPosition.X, RegistryValueKind.DWord);
+                        key.SetValue("Y", hudPosition.Y, RegistryValueKind.DWord);
+                        key.SetValue("FontSize", hudFontSize, RegistryValueKind.DWord);
+                        key.SetValue("Opacity", hudOpacityPercent, RegistryValueKind.DWord);
+                        key.SetValue("ShowBox", showHudBox ? 1 : 0, RegistryValueKind.DWord);
+                        key.SetValue("ClickThrough", isClickThrough ? 1 : 0, RegistryValueKind.DWord);
+                        key.SetValue("HudVisible", isHudVisible ? 1 : 0, RegistryValueKind.DWord);
+                        key.SetValue("ControlTopMost", chkControlTopMost.Checked ? 1 : 0, RegistryValueKind.DWord);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            isRunning = false;
+            if (pollTimer != null) pollTimer.Stop();
+            if (steamReader != null) steamReader.Dispose();
+            if (hudOverlay != null && !hudOverlay.IsDisposed) hudOverlay.Close();
+            base.OnFormClosing(e);
+        }
+    }
+
+    // ==================== 인게임 미니 HUD 오버레이 폼 ====================
+    public class ProfitHudOverlayForm : Form
+    {
+        private const int WS_EX_TRANSPARENT = 0x00000020;
+        private const int WS_EX_LAYERED = 0x00080000;
+        private const int WS_EX_TOOLWINDOW = 0x00000080;
+        private const int WS_EX_NOACTIVATE = 0x08000000;
+
+        private const int GWL_EXSTYLE = -20;
+        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        private const uint SWP_NOMOVE = 0x0002;
+        private const uint SWP_NOSIZE = 0x0001;
+        private const uint SWP_NOACTIVATE = 0x08000000 | 0x0010;
+        private const uint LWA_COLORKEY = 0x00000001;
+        private const uint LWA_ALPHA = 0x00000002;
+
+        [DllImport("user32.dll")]
+        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll")]
+        private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint crKey, byte bAlpha, uint dwFlags);
+
+        public event Action<Point> PositionChangedByDrag;
+        public event Action<int> FontSizeChangedByWheel;
+
+        private string mainText = "WARDOGS 대기 중";
+        private string deltaText = "";
+        private int sign = 0;
+        private int fontSize = 16;
+        private int opacityPercent = 90;
+        private bool showBox = true;
+        private bool clickThrough = false;
+
+        private bool isDragging = false;
+        private Point dragStartMouse;
+        private Point dragStartForm;
+
+        private static readonly Color KeyColor = Color.FromArgb(1, 2, 3);
+        private const uint KeyColorCr = 0x00030201;
+
+        public ProfitHudOverlayForm()
+        {
+            this.Text = "WARDOGS 수익 HUD";
+            try
+            {
+                Icon exeIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+                if (exeIcon != null) this.Icon = exeIcon;
+            }
+            catch { }
+            this.FormBorderStyle = FormBorderStyle.None;
+            this.ShowInTaskbar = false;
+            this.StartPosition = FormStartPosition.Manual;
+            this.BackColor = Color.FromArgb(14, 16, 20);
+            this.DoubleBuffered = true;
+            this.TopMost = true;
+            this.Size = new Size(280, 48);
+
+            this.MouseDown += OnHudMouseDown;
+            this.MouseMove += OnHudMouseMove;
+            this.MouseUp += OnHudMouseUp;
+            this.MouseWheel += OnHudMouseWheel;
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+                if (clickThrough) cp.ExStyle |= WS_EX_TRANSPARENT;
+                return cp;
+            }
+        }
+
+        protected override bool ShowWithoutActivation
+        {
+            get { return true; }
+        }
+
+        public void ConfigureHud(Point pos, int fSize, int opacity, bool box, bool isClickThrough, bool visible)
+        {
+            this.Location = pos;
+            this.fontSize = fSize;
+            this.opacityPercent = opacity;
+            this.showBox = box;
+            this.clickThrough = isClickThrough;
+            this.Cursor = isClickThrough ? Cursors.Default : Cursors.SizeAll;
+
+            if (visible && !this.Visible)
+            {
+                this.Show();
+            }
+            else if (!visible && this.Visible)
+            {
+                this.Hide();
+            }
+
+            ApplyWindowStyles();
+            RecalculateSizeAndRepaint();
+        }
+
+        public void UpdateContent(string text, string delta, int s)
+        {
+            if (mainText == text && deltaText == delta && sign == s) return;
+            mainText = text;
+            deltaText = delta;
+            sign = s;
+            RecalculateSizeAndRepaint();
+        }
+
+        private void ApplyWindowStyles()
+        {
+            if (!this.IsHandleCreated) return;
+
+            int exStyle = GetWindowLong(this.Handle, GWL_EXSTYLE);
+            exStyle |= WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+            if (clickThrough)
+                exStyle |= WS_EX_TRANSPARENT;
+            else
+                exStyle &= ~WS_EX_TRANSPARENT;
+
+            SetWindowLong(this.Handle, GWL_EXSTYLE, exStyle);
+
+            byte alpha = (byte)Math.Max(30, Math.Min(255, (int)Math.Round(255.0 * opacityPercent / 100.0)));
+            if (showBox)
+            {
+                this.BackColor = Color.FromArgb(14, 16, 20);
+                SetLayeredWindowAttributes(this.Handle, 0, alpha, LWA_ALPHA);
+            }
+            else
+            {
+                this.BackColor = KeyColor;
+                SetLayeredWindowAttributes(this.Handle, KeyColorCr, alpha, LWA_COLORKEY | LWA_ALPHA);
+            }
+
+            SetWindowPos(this.Handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+
+        private void RecalculateSizeAndRepaint()
+        {
+            if (!this.IsHandleCreated) return;
+
+            using (Graphics g = this.CreateGraphics())
+            using (Font mainFont = new Font("맑은 고딕", fontSize, FontStyle.Bold))
+            using (Font subFont = new Font("맑은 고딕", Math.Max(9f, fontSize * 0.68f), FontStyle.Bold))
+            {
+                string prefix = sign > 0 ? "▲ " : (sign < 0 ? "▼ " : "● ");
+                SizeF mainSz = g.MeasureString(prefix + mainText, mainFont);
+                SizeF subSz = string.IsNullOrEmpty(deltaText) ? SizeF.Empty : g.MeasureString(deltaText, subFont);
+
+                int w = (int)Math.Ceiling(mainSz.Width + subSz.Width + (string.IsNullOrEmpty(deltaText) ? 28 : 38));
+                int h = (int)Math.Ceiling(Math.Max(mainSz.Height, subSz.Height) + 16);
+
+                w = Math.Max(140, w);
+                h = Math.Max(32, h);
+
+                if (this.Width != w || this.Height != h)
+                {
+                    this.Size = new Size(w, h);
+                }
+            }
+
+            this.Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            Graphics g = e.Graphics;
+
+            Color mainColor;
+            Color accentBorder;
+            string prefix;
+
+            if (sign > 0)
+            {
+                mainColor = Color.FromArgb(46, 235, 122);
+                accentBorder = Color.FromArgb(40, 160, 88);
+                prefix = "▲ ";
+            }
+            else if (sign < 0)
+            {
+                mainColor = Color.FromArgb(255, 88, 88);
+                accentBorder = Color.FromArgb(180, 56, 56);
+                prefix = "▼ ";
+            }
+            else
+            {
+                mainColor = Color.FromArgb(220, 226, 236);
+                accentBorder = Color.FromArgb(65, 72, 84);
+                prefix = "● ";
+            }
+
+            if (showBox)
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+                using (SolidBrush barBrush = new SolidBrush(mainColor))
+                {
+                    g.FillRectangle(barBrush, 0, 0, 4, this.ClientSize.Height);
+                }
+                using (Pen borderPen = new Pen(clickThrough ? accentBorder : Color.FromArgb(110, 150, 220), 1f))
+                {
+                    g.DrawRectangle(borderPen, 0, 0, this.ClientSize.Width - 1, this.ClientSize.Height - 1);
+                }
+            }
+            else
+            {
+                g.TextRenderingHint = TextRenderingHint.SingleBitPerPixelGridFit;
+            }
+
+            using (Font mainFont = new Font("맑은 고딕", fontSize, FontStyle.Bold))
+            using (Font subFont = new Font("맑은 고딕", Math.Max(9f, fontSize * 0.68f), FontStyle.Bold))
+            {
+                string fullMain = prefix + mainText;
+                SizeF mainSz = g.MeasureString(fullMain, mainFont);
+                float x = 12f;
+                float y = (this.ClientSize.Height - mainSz.Height) / 2f;
+
+                using (SolidBrush shadowBrush = new SolidBrush(Color.FromArgb(10, 10, 12)))
+                {
+                    g.DrawString(fullMain, mainFont, shadowBrush, x + 1f, y + 1f);
+                }
+
+                using (SolidBrush textBrush = new SolidBrush(mainColor))
+                {
+                    g.DrawString(fullMain, mainFont, textBrush, x, y);
+                }
+
+                if (!string.IsNullOrEmpty(deltaText))
+                {
+                    float subX = x + mainSz.Width + 4f;
+                    SizeF subSz = g.MeasureString(deltaText, subFont);
+                    float subY = (this.ClientSize.Height - subSz.Height) / 2f;
+
+                    Color subColor = deltaText.StartsWith("(+")
+                        ? Color.FromArgb(130, 250, 175)
+                        : Color.FromArgb(255, 145, 145);
+
+                    using (SolidBrush shadowBrush = new SolidBrush(Color.FromArgb(10, 10, 12)))
+                    {
+                        g.DrawString(deltaText, subFont, shadowBrush, subX + 1f, subY + 1f);
+                    }
+                    using (SolidBrush subBrush = new SolidBrush(subColor))
+                    {
+                        g.DrawString(deltaText, subFont, subBrush, subX, subY);
+                    }
+                }
+            }
+        }
+
+        private void OnHudMouseDown(object sender, MouseEventArgs e)
+        {
+            if (clickThrough) return;
+            if (e.Button == MouseButtons.Left)
+            {
+                isDragging = true;
+                dragStartMouse = Control.MousePosition;
+                dragStartForm = this.Location;
+            }
+        }
+
+        private void OnHudMouseMove(object sender, MouseEventArgs e)
+        {
+            if (!isDragging || clickThrough) return;
+            Point cur = Control.MousePosition;
+            Point next = new Point(
+                dragStartForm.X + (cur.X - dragStartMouse.X),
+                dragStartForm.Y + (cur.Y - dragStartMouse.Y)
+            );
+            this.Location = next;
+        }
+
+        private void OnHudMouseUp(object sender, MouseEventArgs e)
+        {
+            if (isDragging)
+            {
+                isDragging = false;
+                if (PositionChangedByDrag != null)
+                {
+                    PositionChangedByDrag(this.Location);
+                }
+            }
+        }
+
+        private void OnHudMouseWheel(object sender, MouseEventArgs e)
+        {
+            if (clickThrough) return;
+            int delta = e.Delta > 0 ? 1 : -1;
+            if (FontSizeChangedByWheel != null)
+            {
+                FontSizeChangedByWheel(delta);
+            }
+        }
+    }
+}
