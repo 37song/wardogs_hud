@@ -306,12 +306,12 @@ namespace WardogsProfitHudApp
                         int idx = FindBytesSubReverse(pageBuf, 0, bytesRead, needle);
                         while (idx != -1 && isRunning)
                         {
-                            int start = Math.Max(0, idx - 60);
+                            int start = Math.Max(0, idx - 120);
                             int chunkLen = Math.Min(bytesRead - start, 300);
                             string chunk = Encoding.ASCII.GetString(pageBuf, start, chunkLen);
 
                             // 스팀 챗/친구창의 최신 실시간 WARDOGS Rich Presence 검증
-                            if (chunk.Contains("steam_display") || chunk.Contains("in_profit_or_loss") || chunk.Contains("gamedata"))
+                            if (!chunk.Contains("HIST") && (chunk.Contains("steam_display") || chunk.Contains("in_profit_or_loss") || chunk.Contains("gamedata")))
                             {
                                 Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
                                 if (m.Success)
