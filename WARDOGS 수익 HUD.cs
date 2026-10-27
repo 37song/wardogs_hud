@@ -245,8 +245,8 @@ namespace WardogsProfitHudApp
                     bool inGame = false;
                     bool ok = false;
 
-                    // Periodic full re-scan every 2 seconds to detect match start/end accurately
-                    if (++pollTick % 8 == 0)
+                    // Periodic full re-scan every 1.5 seconds to detect match start/end accurately
+                    if (++pollTick % 6 == 0)
                     {
                         cachedAddr = 0;
                     }
@@ -348,6 +348,7 @@ namespace WardogsProfitHudApp
             string latestMatchVal = "";
             string latestMatchState = "frontend";
             bool latestInGame = false;
+            ulong maxTs = 0;
 
             long addr = startAddr;
 
@@ -383,16 +384,13 @@ namespace WardogsProfitHudApp
                                     }
                                     if (match)
                                     {
-                                        int chunkStart = Math.Max(0, i - 350);
-                                        int chunkLen = Math.Min(bytesRead - chunkStart, 650);
+                                        int chunkStart = Math.Max(0, i - 400);
+                                        int chunkLen = Math.Min(bytesRead - chunkStart, 750);
 
-                                        bool isLocal = isRendererTarget;
-                                        if (!isLocal)
-                                        {
-                                            if (userBytes4 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes4) != -1) isLocal = true;
-                                            else if (userBytes8 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes8) != -1) isLocal = true;
-                                            else if (FindBytesSub(pageBuf, chunkStart, chunkLen, histBytes) != -1) isLocal = true;
-                                        }
+                                        bool isLocal = false;
+                                        if (userBytes4 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes4) != -1) isLocal = true;
+                                        else if (userBytes8 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes8) != -1) isLocal = true;
+                                        else if (FindBytesSub(pageBuf, chunkStart, chunkLen, histBytes) != -1) isLocal = true;
 
                                         if (isLocal)
                                         {
@@ -403,32 +401,48 @@ namespace WardogsProfitHudApp
                                             if (ms.Success)
                                             {
                                                 string st = ms.Groups[1].Value;
-                                                latestMatchAddr = baseAddr + offset + i;
 
-                                                if (st == "KOTH" && !body.Contains("unknown") && !body.Contains("match_lost"))
+                                                // Extract timestamp if present (\xf8\x02 or \xe8\x02)
+                                                ulong ts = 0;
+                                                int tIdx = FindBytesSub(pageBuf, Math.Max(0, i - 120), Math.Min(120, i), new byte[] { 0xf8, 0x02 });
+                                                if (tIdx != -1) ts = DecodeVarint(pageBuf, tIdx + 2);
+                                                else
                                                 {
-                                                    Match mp = Regex.Match(body, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
-                                                    if (mp.Success)
+                                                    tIdx = FindBytesSub(pageBuf, Math.Max(0, i - 120), Math.Min(120, i), new byte[] { 0xe8, 0x02 });
+                                                    if (tIdx != -1) ts = DecodeVarint(pageBuf, tIdx + 2);
+                                                }
+
+                                                bool isNewer = (ts > maxTs) || (ts == maxTs && (baseAddr + offset + i) > latestMatchAddr);
+                                                if (isNewer)
+                                                {
+                                                    maxTs = ts;
+                                                    latestMatchAddr = baseAddr + offset + i;
+
+                                                    if (st == "KOTH" && !body.Contains("unknown") && !body.Contains("match_lost"))
                                                     {
-                                                        latestMatchVal = mp.Groups[1].Value.Replace(" ", "");
-                                                        Match mst = Regex.Match(body, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                                        if (mst.Success) latestMatchState = mst.Groups[1].Value.ToLowerInvariant();
-                                                        else latestMatchState = latestMatchVal.Contains("-") ? "loss" : "profit";
-                                                        latestInGame = true;
+                                                        Match mp = Regex.Match(body, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
+                                                        if (mp.Success)
+                                                        {
+                                                            latestMatchVal = mp.Groups[1].Value.Replace(" ", "");
+                                                            Match mst = Regex.Match(body, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+                                                            if (mst.Success) latestMatchState = mst.Groups[1].Value.ToLowerInvariant();
+                                                            else latestMatchState = latestMatchVal.Contains("-") ? "loss" : "profit";
+                                                            latestInGame = true;
+                                                        }
+                                                        else
+                                                        {
+                                                            latestInGame = false;
+                                                            latestMatchVal = "";
+                                                            latestMatchState = "frontend";
+                                                        }
                                                     }
                                                     else
                                                     {
+                                                        // Frontend / ShootingRange / etc
                                                         latestInGame = false;
                                                         latestMatchVal = "";
                                                         latestMatchState = "frontend";
                                                     }
-                                                }
-                                                else
-                                                {
-                                                    // Frontend / ShootingRange / etc
-                                                    latestInGame = false;
-                                                    latestMatchVal = "";
-                                                    latestMatchState = "frontend";
                                                 }
                                             }
                                         }
@@ -454,6 +468,21 @@ namespace WardogsProfitHudApp
             }
 
             return false;
+        }
+
+        private static ulong DecodeVarint(byte[] data, int pos)
+        {
+            ulong val = 0;
+            int shift = 0;
+            while (pos < data.Length)
+            {
+                byte b = data[pos++];
+                val |= ((ulong)(b & 0x7f)) << shift;
+                if ((b & 0x80) == 0) break;
+                shift += 7;
+                if (shift >= 64) break;
+            }
+            return val;
         }
 
         private static int FindBytesSub(byte[] src, int startIdx, int count, byte[] pattern)
