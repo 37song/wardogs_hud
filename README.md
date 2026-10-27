@@ -66,7 +66,7 @@
 
 <br>
 
-<img src="./kakaopay_qr.png" width="170" alt="카카오페이 송금 QR코드" />
+<img src="./kakaopay_qr.png" width="85" alt="카카오페이 송금 QR코드" />
 
 * **PC 사용자**: 스마트폰 카메라 앱 또는 카카오톡으로 위 **QR코드를 스캔**하시면 즉시 송금 화면이 열립니다.
 * **스마트폰 사용자**: **[📱 카카오페이 송금 바로가기](https://qr.kakaopay.com/Ej7jxWIW1)** 터치 시 카카오톡 송금창으로 바로 이동합니다.
