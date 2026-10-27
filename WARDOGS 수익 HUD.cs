@@ -168,8 +168,8 @@ namespace WardogsProfitHudApp
                     }
                     if (targetPid == 0)
                     {
-                        Process targetRenderer = FindTargetRenderer();
-                        if (targetRenderer != null) targetPid = targetRenderer.Id;
+                        Process[] sps = Process.GetProcessesByName("steam");
+                        if (sps != null && sps.Length > 0) targetPid = sps[0].Id;
                     }
 
                     if (targetPid == 0)
@@ -197,15 +197,13 @@ namespace WardogsProfitHudApp
                     bool inGame = false;
                     bool ok = false;
 
-                    // 1. 캐시된 KeyValues 주소 국소 초고속 직접 읽기 (0.01ms)
+                    // 1. 캐시된 로컬 유저 Rich Presence 주소 국소 초고속 직접 읽기 (0.01ms)
                     if (cachedAddr > 0)
                     {
                         IntPtr nRead;
-                        long readStart = Math.Max(0, cachedAddr - 64);
-                        if (ReadProcessMemory(hProc, (IntPtr)readStart, pageBuf, 256, out nRead) && (int)nRead > 64)
+                        if (ReadProcessMemory(hProc, (IntPtr)cachedAddr, pageBuf, 256, out nRead) && (int)nRead > 64)
                         {
-                            int bytesRead = (int)nRead;
-                            string chunk = Encoding.ASCII.GetString(pageBuf, 0, bytesRead);
+                            string chunk = Encoding.ASCII.GetString(pageBuf, 0, (int)nRead);
 
                             if (chunk.Contains("#Status_KOTH") && (chunk.Contains("playing") || chunk.Contains("pre_match")))
                             {
@@ -237,7 +235,7 @@ namespace WardogsProfitHudApp
                         }
                     }
 
-                    // 2. 캐시가 없거나 유효하지 않은 경우 전체 가상 메모리에서 활성 Rich Presence KeyValues 스캔
+                    // 2. 캐시가 없는 경우 로컬 유저 전용 Rich Presence 버퍼 스캔
                     if (!ok)
                     {
                         ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x40000000000L, pageBuf, out foundAddr, out val, out state, out inGame);
@@ -331,17 +329,22 @@ namespace WardogsProfitHudApp
         {
             foundAddr = 0; val = ""; state = ""; inGame = false;
 
-            byte[] needle = Encoding.ASCII.GetBytes("\x01profit_loss\x00");
+            byte[] needle = new byte[] { (byte)'R', (byte)'P', 0x00, 0x01, (byte)'s', (byte)'t', (byte)'e', (byte)'a', (byte)'m', (byte)'_', (byte)'d', (byte)'i', (byte)'s', (byte)'p', (byte)'l', (byte)'a', (byte)'y', 0x00 };
+            byte[] jaTag = new byte[] { (byte)'J', (byte)'A', (byte)'=', (byte)'=' };
 
             long addr = startAddr;
+            long fallbackAddr = 0;
+            string fallbackVal = "", fallbackState = "";
+            bool fallbackInGame = false;
+
             while (addr < endAddr && isRunning)
             {
                 MEMORY_BASIC_INFORMATION mbi;
                 if (VirtualQueryEx(hProc, (IntPtr)addr, out mbi, Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION))) == 0)
                     break;
 
-                long baseAddr = (long)mbi.BaseAddress;
-                long size = (long)mbi.RegionSize;
+                long baseAddr = mbi.BaseAddress.ToInt64();
+                long size = mbi.RegionSize.ToInt64();
                 if (size <= 0) break;
                 if (baseAddr == 0) baseAddr = addr;
 
@@ -357,34 +360,69 @@ namespace WardogsProfitHudApp
                             int bytesRead = (int)nRead;
                             for (int i = 0; i <= bytesRead - needle.Length; i++)
                             {
-                                if (pageBuf[i] == needle[0] && pageBuf[i + 1] == needle[1] && pageBuf[i + needle.Length - 1] == 0)
+                                if (pageBuf[i] == needle[0] && pageBuf[i + 1] == needle[1] && pageBuf[i + 2] == 0)
                                 {
                                     bool match = true;
-                                    for (int k = 2; k < needle.Length - 1; k++)
+                                    for (int k = 3; k < needle.Length; k++)
                                     {
                                         if (pageBuf[i + k] != needle[k]) { match = false; break; }
                                     }
                                     if (match)
                                     {
-                                        int chunkStart = Math.Max(0, i - 60);
-                                        int chunkLen = Math.Min(bytesRead - chunkStart, 160);
-                                        string chunk = Encoding.ASCII.GetString(pageBuf, chunkStart, chunkLen);
-
-                                        if (chunk.Contains("#Status_KOTH") && (chunk.Contains("playing") || chunk.Contains("pre_match")))
+                                        int preStart = Math.Max(0, i - 40);
+                                        bool hasJa = false;
+                                        for (int j = preStart; j <= i - 4; j++)
                                         {
+                                            if (pageBuf[j] == jaTag[0] && pageBuf[j+1] == jaTag[1] && pageBuf[j+2] == jaTag[2] && pageBuf[j+3] == jaTag[3])
+                                            {
+                                                hasJa = true;
+                                                break;
+                                            }
+                                        }
+
+                                        int chunkLen = Math.Min(bytesRead - i, 200);
+                                        string chunk = Encoding.ASCII.GetString(pageBuf, i, chunkLen);
+
+                                        if (hasJa)
+                                        {
+                                            // 1순위: 로컬 유저 전용 고유 Rich Presence 버퍼
                                             foundAddr = baseAddr + offset + i;
-                                            int valStart = i + needle.Length;
-                                            int valEnd = valStart;
-                                            while (valEnd < bytesRead && pageBuf[valEnd] != 0) valEnd++;
-                                            val = Encoding.ASCII.GetString(pageBuf, valStart, valEnd - valStart).Trim();
+                                            if (chunk.Contains("#Status_KOTH") && (chunk.Contains("playing") || chunk.Contains("pre_match")))
+                                            {
+                                                Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
+                                                if (m.Success)
+                                                {
+                                                    val = m.Groups[1].Value.Replace(" ", "");
+                                                    Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+                                                    if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
+                                                    else if (val.Contains("-")) state = "loss";
+                                                    else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
 
-                                            Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                            if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
-                                            else if (val.Contains("-")) state = "loss";
-                                            else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
-
-                                            inGame = true;
-                                            return true;
+                                                    inGame = true;
+                                                    return true;
+                                                }
+                                            }
+                                            else if (chunk.Contains("#Status_Frontend") || chunk.Contains("Frontend"))
+                                            {
+                                                state = "frontend";
+                                                inGame = false;
+                                                val = "";
+                                                return true;
+                                            }
+                                        }
+                                        else if (fallbackAddr == 0 && chunk.Contains("#Status_KOTH"))
+                                        {
+                                            Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
+                                            if (m.Success)
+                                            {
+                                                fallbackAddr = baseAddr + offset + i;
+                                                fallbackVal = m.Groups[1].Value.Replace(" ", "");
+                                                Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+                                                if (ms.Success) fallbackState = ms.Groups[1].Value.ToLowerInvariant();
+                                                else if (fallbackVal.Contains("-")) fallbackState = "loss";
+                                                else if (fallbackVal.Contains("+") || (!fallbackVal.Contains("-") && fallbackVal != "$0")) fallbackState = "profit";
+                                                fallbackInGame = true;
+                                            }
                                         }
                                     }
                                 }
@@ -396,6 +434,15 @@ namespace WardogsProfitHudApp
                 long nextAddr = baseAddr + size;
                 if (nextAddr <= addr) break;
                 addr = nextAddr;
+            }
+
+            if (fallbackAddr > 0)
+            {
+                foundAddr = fallbackAddr;
+                val = fallbackVal;
+                state = fallbackState;
+                inGame = fallbackInGame;
+                return true;
             }
 
             state = "frontend";
