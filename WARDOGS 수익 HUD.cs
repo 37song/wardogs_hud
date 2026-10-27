@@ -146,7 +146,8 @@ namespace WardogsProfitHudApp
             {
                 try
                 {
-                    CheckProcesses(out steamPid, ref steamId64);
+                    uint activeUser;
+                    CheckProcesses(out steamPid, out activeUser, ref steamId64);
                     if (++refreshTick % 4 == 0) cachedAddr = 0; // 1초마다 최신 주소 자동 재스캔 (과거 $0 고착 원천 방지)
 
                     if (!IsSteamRunning)
@@ -240,7 +241,7 @@ namespace WardogsProfitHudApp
                     // 2. 캐시가 없는 경우 로컬 유저 전용 Rich Presence 버퍼 스캔
                     if (!ok)
                     {
-                        ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x40000000000L, pageBuf, out foundAddr, out val, out state, out inGame);
+                        ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x40000000000L, activeUser, steamId64, pageBuf, out foundAddr, out val, out state, out inGame);
                         if (ok && foundAddr > 0 && inGame)
                         {
                             cachedAddr = foundAddr;
@@ -292,9 +293,10 @@ namespace WardogsProfitHudApp
             return best;
         }
 
-        private void CheckProcesses(out int steamPid, ref ulong steamId64)
+        private void CheckProcesses(out int steamPid, out uint activeUser, ref ulong steamId64)
         {
             steamPid = 0;
+            activeUser = 0;
             try
             {
                 using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam\ActiveProcess"))
@@ -302,7 +304,7 @@ namespace WardogsProfitHudApp
                     if (key != null)
                     {
                         steamPid = Convert.ToInt32(key.GetValue("pid", 0));
-                        uint activeUser = Convert.ToUInt32(key.GetValue("ActiveUser", 0));
+                        activeUser = Convert.ToUInt32(key.GetValue("ActiveUser", 0));
                         if (activeUser != 0) steamId64 = 76561197960265728UL + activeUser;
                     }
                 }
@@ -327,15 +329,23 @@ namespace WardogsProfitHudApp
             IsWardogsRunning = wardogsFound;
         }
 
-        private bool ScanNativeStreamRange(IntPtr hProc, long startAddr, long endAddr, byte[] pageBuf, out long foundAddr, out string val, out string state, out bool inGame)
+        private bool ScanNativeStreamRange(IntPtr hProc, long startAddr, long endAddr, uint activeUser, ulong steamId64, byte[] pageBuf, out long foundAddr, out string val, out string state, out bool inGame)
         {
             foundAddr = 0; val = ""; state = ""; inGame = false;
 
-            byte[] needle = new byte[] { (byte)'R', (byte)'P', 0x00, 0x01, (byte)'s', (byte)'t', (byte)'e', (byte)'a', (byte)'m', (byte)'_', (byte)'d', (byte)'i', (byte)'s', (byte)'p', (byte)'l', (byte)'a', (byte)'y', 0x00 };
+            byte[] needle = new byte[] { (byte)'p', (byte)'r', (byte)'o', (byte)'f', (byte)'i', (byte)'t', (byte)'_', (byte)'l', (byte)'o', (byte)'s', (byte)'s' };
 
-            long bestAddr = 0;
-            string bestVal = "", bestState = "";
-            bool bestInGame = false;
+            byte[] userBytes4 = activeUser != 0 ? BitConverter.GetBytes(activeUser) : null;
+            byte[] userBytes8 = steamId64 != 0 ? BitConverter.GetBytes(steamId64) : null;
+            byte[] userStrBytes = steamId64 != 0 ? Encoding.ASCII.GetBytes(steamId64.ToString()) : null;
+
+            long bestUserAddr = 0;
+            string bestUserVal = "", bestUserState = "";
+            bool bestUserInGame = false;
+
+            long fallbackAddr = 0;
+            string fallbackVal = "", fallbackState = "";
+            bool fallbackInGame = false;
 
             long addr = startAddr;
 
@@ -362,40 +372,58 @@ namespace WardogsProfitHudApp
                             int bytesRead = (int)nRead;
                             for (int i = 0; i <= bytesRead - needle.Length; i++)
                             {
-                                if (pageBuf[i] == needle[0] && pageBuf[i + 1] == needle[1] && pageBuf[i + 2] == 0)
+                                if (pageBuf[i] == needle[0] && pageBuf[i + 1] == needle[1] && pageBuf[i + 2] == needle[2] && pageBuf[i + 3] == needle[3])
                                 {
                                     bool match = true;
-                                    for (int k = 3; k < needle.Length; k++)
+                                    for (int k = 4; k < needle.Length; k++)
                                     {
                                         if (pageBuf[i + k] != needle[k]) { match = false; break; }
                                     }
                                     if (match)
                                     {
-                                        int chunkLen = Math.Min(bytesRead - i, 200);
-                                        string chunk = Encoding.ASCII.GetString(pageBuf, i, chunkLen);
+                                        int chunkStart = Math.Max(0, i - 100);
+                                        int chunkLen = Math.Min(bytesRead - chunkStart, 250);
+                                        string chunk = Encoding.ASCII.GetString(pageBuf, chunkStart, chunkLen);
 
-                                        if (chunk.Contains("#Status_KOTH") && (chunk.Contains("playing") || chunk.Contains("pre_match")))
+                                        if (chunk.Contains("#Status_KOTH") || chunk.Contains("Status_KOTH"))
                                         {
                                             Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
                                             if (m.Success)
                                             {
-                                                // 과거 주소를 덮어쓰고 가장 최신(가장 큰 주소) 레코드를 항상 선택!
-                                                bestAddr = baseAddr + offset + i;
-                                                bestVal = m.Groups[1].Value.Replace(" ", "");
+                                                string pVal = m.Groups[1].Value.Replace(" ", "");
+                                                string pState = "";
                                                 Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                                if (ms.Success) bestState = ms.Groups[1].Value.ToLowerInvariant();
-                                                else if (bestVal.Contains("-")) bestState = "loss";
-                                                else if (bestVal.Contains("+") || (!bestVal.Contains("-") && bestVal != "$0")) bestState = "profit";
+                                                if (ms.Success) pState = ms.Groups[1].Value.ToLowerInvariant();
+                                                else if (pVal.Contains("-")) pState = "loss";
+                                                else if (pVal.Contains("+") || (!pVal.Contains("-") && pVal != "$0")) pState = "profit";
 
-                                                bestInGame = true;
+                                                bool isLocalUser = false;
+                                                if (userBytes4 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes4) != -1) isLocalUser = true;
+                                                else if (userBytes8 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes8) != -1) isLocalUser = true;
+                                                else if (userStrBytes != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userStrBytes) != -1) isLocalUser = true;
+
+                                                if (isLocalUser)
+                                                {
+                                                    bestUserAddr = baseAddr + offset + i;
+                                                    bestUserVal = pVal;
+                                                    bestUserState = pState;
+                                                    bestUserInGame = true;
+                                                }
+                                                else
+                                                {
+                                                    fallbackAddr = baseAddr + offset + i;
+                                                    fallbackVal = pVal;
+                                                    fallbackState = pState;
+                                                    fallbackInGame = true;
+                                                }
                                             }
                                         }
                                         else if (chunk.Contains("#Status_Frontend") || chunk.Contains("Frontend"))
                                         {
-                                            bestAddr = baseAddr + offset + i;
-                                            bestState = "frontend";
-                                            bestInGame = false;
-                                            bestVal = "";
+                                            bestUserAddr = baseAddr + offset + i;
+                                            bestUserState = "frontend";
+                                            bestUserInGame = false;
+                                            bestUserVal = "";
                                         }
                                     }
                                 }
@@ -409,12 +437,21 @@ namespace WardogsProfitHudApp
                 addr = nextAddr;
             }
 
-            if (bestAddr > 0)
+            if (bestUserAddr > 0)
             {
-                foundAddr = bestAddr;
-                val = bestVal;
-                state = bestState;
-                inGame = bestInGame;
+                foundAddr = bestUserAddr;
+                val = bestUserVal;
+                state = bestUserState;
+                inGame = bestUserInGame;
+                return true;
+            }
+
+            if (fallbackAddr > 0)
+            {
+                foundAddr = fallbackAddr;
+                val = fallbackVal;
+                state = fallbackState;
+                inGame = fallbackInGame;
                 return true;
             }
 
@@ -424,17 +461,18 @@ namespace WardogsProfitHudApp
             return false;
         }
 
-        private static int FindBytesSubReverse(byte[] src, int startIdx, int count, byte[] needle)
+        private static int FindBytesSub(byte[] src, int startIdx, int count, byte[] pattern)
         {
-            int max = startIdx + count - needle.Length;
-            for (int i = max; i >= startIdx; i--)
+            if (pattern == null || pattern.Length == 0) return -1;
+            int max = startIdx + count - pattern.Length;
+            for (int i = startIdx; i <= max; i++)
             {
-                bool ok = true;
-                for (int j = 0; j < needle.Length; j++)
+                bool match = true;
+                for (int j = 0; j < pattern.Length; j++)
                 {
-                    if (src[i + j] != needle[j]) { ok = false; break; }
+                    if (src[i + j] != pattern[j]) { match = false; break; }
                 }
-                if (ok) return i;
+                if (match) return i;
             }
             return -1;
         }
