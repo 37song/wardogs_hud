@@ -885,7 +885,7 @@ public class MainHudControlForm : Form
             {
                 if (steamReader.IsWardogsRunning)
                 {
-                    displayText = "매치 대기 중";
+                    displayText = "대기 중";
                 }
                 else
                 {
