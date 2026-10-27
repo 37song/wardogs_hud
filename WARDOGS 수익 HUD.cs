@@ -385,7 +385,6 @@ namespace WardogsProfitHudApp
         private NumericUpDown numFontSize, numOpacity;
         private CheckBox chkShowBox;
         private CheckBox chkControlTopMost;
-        private Label lblSteamStatus;
         private Label lblLiveValuePreview;
         private bool suppressEvents = false;
 
@@ -470,18 +469,9 @@ namespace WardogsProfitHudApp
                 ForeColor = Color.FromArgb(158, 164, 174)
             };
 
-            lblSteamStatus = new Label()
-            {
-                Text = "스팀 프로세스 연동 중...",
-                Location = new Point(12, 22),
-                Size = new Size(268, 18),
-                Font = new Font("맑은 고딕", 8.5f, FontStyle.Regular),
-                ForeColor = Color.FromArgb(140, 195, 255)
-            };
-
             Panel pnlPreview = new Panel()
             {
-                Location = new Point(12, 44),
+                Location = new Point(12, 22),
                 Size = new Size(268, 46),
                 BackColor = Color.FromArgb(18, 18, 22),
                 BorderStyle = BorderStyle.FixedSingle
@@ -497,13 +487,13 @@ namespace WardogsProfitHudApp
             };
             pnlPreview.Controls.Add(lblLiveValuePreview);
 
-            grpStatus.Controls.AddRange(new Control[] { lblSteamStatus, pnlPreview });
+            grpStatus.Controls.Add(pnlPreview);
 
             GroupBox grpControls = new GroupBox()
             {
                 Text = "HUD 오버레이 설정 (F7: 표시 / F8: 위치잠금)",
                 Font = new Font("맑은 고딕", 9f, FontStyle.Bold),
-                Location = new Point(14, 118),
+                Location = new Point(14, 98),
                 Size = new Size(292, 138),
                 ForeColor = Color.FromArgb(158, 164, 174)
             };
@@ -696,20 +686,7 @@ namespace WardogsProfitHudApp
 
             bool found = steamReader.Poll(out profitLoss, out state, out faction, out gameState, out ts);
 
-            if (steamReader.IsSteamRunning)
-            {
-                lblSteamStatus.Text = steamReader.IsWardogsRunning
-                    ? "스팀 연동: WARDOGS 실행 중"
-                    : "스팀 연동: 게임 대기 중";
-                lblSteamStatus.ForeColor = steamReader.IsWardogsRunning
-                    ? Color.FromArgb(110, 230, 155)
-                    : Color.FromArgb(140, 195, 255);
-            }
-            else
-            {
-                lblSteamStatus.Text = "스팀 클라이언트를 찾을 수 없습니다.";
-                lblSteamStatus.ForeColor = Color.FromArgb(235, 110, 110);
-            }
+
 
             string displayText;
             int sign = 0;
