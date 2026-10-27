@@ -165,21 +165,7 @@ namespace WardogsProfitHudApp
             catch { }
 
             IsSteamRunning = steamPid != 0 && (Process.GetProcessesByName("steam").Length > 0 || Process.GetProcessesByName("steamwebhelper").Length > 0);
-
-            bool wardogsFound = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Length > 0;
-            if (!wardogsFound)
-            {
-                try
-                {
-                    using (RegistryKey appKey = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam\Apps\1867240"))
-                    {
-                        if (appKey != null && Convert.ToInt32(appKey.GetValue("Running", 0)) == 1)
-                            wardogsFound = true;
-                    }
-                }
-                catch { }
-            }
-            IsWardogsRunning = wardogsFound;
+            IsWardogsRunning = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Length > 0;
         }
 
         private void WorkerLoop()
@@ -189,6 +175,7 @@ namespace WardogsProfitHudApp
             IntPtr hProc = IntPtr.Zero;
             int currentPid = 0;
             long cachedAddr = 0;
+            int pollTick = 0;
 
             byte[] pageBuf = new byte[65536];
 
@@ -199,15 +186,16 @@ namespace WardogsProfitHudApp
                     uint activeUser;
                     CheckProcesses(out steamPid, out activeUser, ref steamId64);
 
-                    if (!IsSteamRunning)
+                    if (!IsSteamRunning || !IsWardogsRunning)
                     {
-                        if (hProc != IntPtr.Zero) { CloseHandle(hProc); hProc = IntPtr.Zero; currentPid = 0; }
+                        if (!IsSteamRunning && hProc != IntPtr.Zero) { CloseHandle(hProc); hProc = IntPtr.Zero; currentPid = 0; }
                         cachedAddr = 0;
                         lock (syncLock) { hasData = false; curVal = ""; curState = "frontend"; }
                         Thread.Sleep(1000);
                         continue;
                     }
 
+                    // Prefer steamwebhelper (Steam Chat UI), fallback to steam.exe
                     Process renderer = FindTargetRenderer();
                     int targetPid = 0;
                     bool isRenderer = false;
@@ -257,36 +245,46 @@ namespace WardogsProfitHudApp
                     bool inGame = false;
                     bool ok = false;
 
+                    // Periodic full re-scan every 2 seconds to detect match start/end accurately
+                    if (++pollTick % 8 == 0)
+                    {
+                        cachedAddr = 0;
+                    }
+
+                    // 1. Cached fast read (0.01ms)
                     if (cachedAddr > 0)
                     {
                         IntPtr nRead;
-                        long readStart = Math.Max(0, cachedAddr - 60);
-                        if (ReadProcessMemory(hProc, (IntPtr)readStart, pageBuf, 256, out nRead) && (int)nRead > 64)
+                        if (ReadProcessMemory(hProc, (IntPtr)cachedAddr, pageBuf, 256, out nRead) && (int)nRead > 64)
                         {
-                            string chunk = Encoding.ASCII.GetString(pageBuf, 0, (int)nRead);
-
-                            if ((chunk.Contains("#Status_KOTH") || chunk.Contains("Status_KOTH") || chunk.Contains("playing")) &&
-                                !chunk.Contains("unknown") && !chunk.Contains("match_lost"))
+                            string body = Encoding.ASCII.GetString(pageBuf, 0, (int)nRead);
+                            Match ms = Regex.Match(body, @"#Status_(\w+)");
+                            if (ms.Success)
                             {
-                                Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
-                                if (m.Success)
+                                string st = ms.Groups[1].Value;
+                                if (st == "KOTH" && !body.Contains("unknown") && !body.Contains("match_lost"))
                                 {
-                                    val = m.Groups[1].Value.Replace(" ", "");
-                                    Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                    if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
-                                    else if (val.Contains("-")) state = "loss";
-                                    else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
+                                    Match mp = Regex.Match(body, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
+                                    if (mp.Success)
+                                    {
+                                        val = mp.Groups[1].Value.Replace(" ", "");
+                                        Match mst = Regex.Match(body, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+                                        if (mst.Success) state = mst.Groups[1].Value.ToLowerInvariant();
+                                        else state = val.Contains("-") ? "loss" : "profit";
 
-                                    inGame = true;
-                                    ok = true;
+                                        inGame = true;
+                                        ok = true;
+                                    }
                                 }
-                            }
-                            else if (chunk.Contains("#Status_Frontend") || chunk.Contains("Frontend"))
-                            {
-                                state = "frontend";
-                                inGame = false;
-                                val = "";
-                                ok = true;
+                                else
+                                {
+                                    // Returned to frontend/menu
+                                    state = "frontend";
+                                    inGame = false;
+                                    val = "";
+                                    ok = true;
+                                    cachedAddr = 0;
+                                }
                             }
                         }
 
@@ -296,6 +294,7 @@ namespace WardogsProfitHudApp
                         }
                     }
 
+                    // 2. Full scan for steam_display (tracks real-time status transitions)
                     if (!ok)
                     {
                         long scanStart = 0x10000000000L;
@@ -304,6 +303,10 @@ namespace WardogsProfitHudApp
                         if (ok && foundAddr > 0 && inGame)
                         {
                             cachedAddr = foundAddr;
+                        }
+                        else
+                        {
+                            cachedAddr = 0;
                         }
                     }
 
@@ -325,7 +328,7 @@ namespace WardogsProfitHudApp
                 }
                 catch { }
 
-                Thread.Sleep(200);
+                Thread.Sleep(250);
             }
 
             if (hProc != IntPtr.Zero) CloseHandle(hProc);
@@ -333,18 +336,18 @@ namespace WardogsProfitHudApp
 
         private bool ScanNativeStreamRange(IntPtr hProc, long startAddr, long endAddr, uint activeUser, ulong steamId64, bool isRendererTarget, byte[] pageBuf, out long foundAddr, out string val, out string state, out bool inGame)
         {
-            foundAddr = 0; val = ""; state = ""; inGame = false;
+            foundAddr = 0; val = ""; state = "frontend"; inGame = false;
 
-            byte[] needle = new byte[] { (byte)'p', (byte)'r', (byte)'o', (byte)'f', (byte)'i', (byte)'t', (byte)'_', (byte)'l', (byte)'o', (byte)'s', (byte)'s' };
+            byte[] needle = Encoding.ASCII.GetBytes("steam_display");
 
             byte[] userBytes4 = activeUser != 0 ? BitConverter.GetBytes(activeUser) : null;
             byte[] userBytes8 = steamId64 != 0 ? BitConverter.GetBytes(steamId64) : null;
-            byte[] userStrBytes = steamId64 != 0 ? Encoding.ASCII.GetBytes(steamId64.ToString()) : null;
             byte[] histBytes = Encoding.ASCII.GetBytes("HIST");
 
-            long bestUserAddr = 0;
-            string bestUserVal = "", bestUserState = "";
-            bool bestUserInGame = false;
+            long latestMatchAddr = 0;
+            string latestMatchVal = "";
+            string latestMatchState = "frontend";
+            bool latestInGame = false;
 
             long addr = startAddr;
 
@@ -371,10 +374,10 @@ namespace WardogsProfitHudApp
                             int bytesRead = (int)nRead;
                             for (int i = 0; i <= bytesRead - needle.Length; i++)
                             {
-                                if (pageBuf[i] == needle[0] && pageBuf[i + 1] == needle[1] && pageBuf[i + 2] == needle[2] && pageBuf[i + 3] == needle[3])
+                                if (pageBuf[i] == needle[0] && pageBuf[i + 1] == needle[1] && pageBuf[i + 6] == needle[6] && pageBuf[i + 12] == needle[12])
                                 {
                                     bool match = true;
-                                    for (int k = 4; k < needle.Length; k++)
+                                    for (int k = 2; k < needle.Length; k++)
                                     {
                                         if (pageBuf[i + k] != needle[k]) { match = false; break; }
                                     }
@@ -382,45 +385,52 @@ namespace WardogsProfitHudApp
                                     {
                                         int chunkStart = Math.Max(0, i - 350);
                                         int chunkLen = Math.Min(bytesRead - chunkStart, 650);
-                                        string chunk = Encoding.ASCII.GetString(pageBuf, chunkStart, chunkLen);
 
-                                        if ((chunk.Contains("#Status_KOTH") || chunk.Contains("Status_KOTH") || (isRendererTarget && chunk.Contains("playing"))) &&
-                                            !chunk.Contains("unknown") && !chunk.Contains("match_lost"))
+                                        bool isLocal = isRendererTarget;
+                                        if (!isLocal)
                                         {
-                                            Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
-                                            if (m.Success)
+                                            if (userBytes4 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes4) != -1) isLocal = true;
+                                            else if (userBytes8 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes8) != -1) isLocal = true;
+                                            else if (FindBytesSub(pageBuf, chunkStart, chunkLen, histBytes) != -1) isLocal = true;
+                                        }
+
+                                        if (isLocal)
+                                        {
+                                            int bodyLen = Math.Min(bytesRead - i, 250);
+                                            string body = Encoding.ASCII.GetString(pageBuf, i, bodyLen);
+
+                                            Match ms = Regex.Match(body, @"#Status_(\w+)");
+                                            if (ms.Success)
                                             {
-                                                string pVal = m.Groups[1].Value.Replace(" ", "");
-                                                string pState = "";
-                                                Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                                if (ms.Success) pState = ms.Groups[1].Value.ToLowerInvariant();
-                                                else if (pVal.Contains("-")) pState = "loss";
-                                                else if (pVal.Contains("+") || (!pVal.Contains("-") && pVal != "$0")) pState = "profit";
+                                                string st = ms.Groups[1].Value;
+                                                latestMatchAddr = baseAddr + offset + i;
 
-                                                bool isLocalUser = isRendererTarget;
-                                                if (!isLocalUser)
+                                                if (st == "KOTH" && !body.Contains("unknown") && !body.Contains("match_lost"))
                                                 {
-                                                    if (userBytes4 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes4) != -1) isLocalUser = true;
-                                                    else if (userBytes8 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes8) != -1) isLocalUser = true;
-                                                    else if (userStrBytes != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userStrBytes) != -1) isLocalUser = true;
-                                                    else if (FindBytesSub(pageBuf, chunkStart, chunkLen, histBytes) != -1) isLocalUser = true;
+                                                    Match mp = Regex.Match(body, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
+                                                    if (mp.Success)
+                                                    {
+                                                        latestMatchVal = mp.Groups[1].Value.Replace(" ", "");
+                                                        Match mst = Regex.Match(body, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+                                                        if (mst.Success) latestMatchState = mst.Groups[1].Value.ToLowerInvariant();
+                                                        else latestMatchState = latestMatchVal.Contains("-") ? "loss" : "profit";
+                                                        latestInGame = true;
+                                                    }
+                                                    else
+                                                    {
+                                                        latestInGame = false;
+                                                        latestMatchVal = "";
+                                                        latestMatchState = "frontend";
+                                                    }
                                                 }
-
-                                                if (isLocalUser)
+                                                else
                                                 {
-                                                    bestUserAddr = baseAddr + offset + i;
-                                                    bestUserVal = pVal;
-                                                    bestUserState = pState;
-                                                    bestUserInGame = true;
+                                                    // Frontend / ShootingRange / etc
+                                                    latestInGame = false;
+                                                    latestMatchVal = "";
+                                                    latestMatchState = "frontend";
                                                 }
                                             }
-                                        }
-                                        else if (chunk.Contains("#Status_Frontend") || chunk.Contains("Frontend"))
-                                        {
-                                            bestUserAddr = baseAddr + offset + i;
-                                            bestUserState = "frontend";
-                                            bestUserInGame = false;
-                                            bestUserVal = "";
                                         }
                                     }
                                 }
@@ -434,18 +444,15 @@ namespace WardogsProfitHudApp
                 addr = nextAddr;
             }
 
-            if (bestUserAddr > 0)
+            if (latestMatchAddr > 0)
             {
-                foundAddr = bestUserAddr;
-                val = bestUserVal;
-                state = bestUserState;
-                inGame = bestUserInGame;
+                foundAddr = latestMatchAddr;
+                val = latestMatchVal;
+                state = latestMatchState;
+                inGame = latestInGame;
                 return true;
             }
 
-            state = "frontend";
-            inGame = false;
-            val = "";
             return false;
         }
 
