@@ -56,3 +56,12 @@
 
 * **언어**: C# (.NET Framework 4.0 이상 기본 지원 / 별도 런타임 설치 불필요)
 * **소스 코드**: [WARDOGS 수익 HUD.cs](./WARDOGS%20수익%20HUD.cs)
+
+---
+
+## ☕ 개발자 후원 (Support)
+
+본 프로그램이 유용하셨다면 개발자에게 따뜻한 커피 한 잔을 선물해 주세요!  
+보내주신 응원은 지속적인 업데이트와 프로그램 유지 관리에 큰 힘이 됩니다.
+
+[![KakaoPay 후원하기](https://img.shields.io/badge/KakaoPay-후원하기-FFCD00?style=for-the-badge&logo=kakaotalk&logoColor=black)](https://qr.kakaopay.com/Ej7jxWIW1)
