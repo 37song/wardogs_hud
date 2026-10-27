@@ -731,18 +731,18 @@ namespace WardogsProfitHudApp
                 if (state == "loss" || profitLoss.Contains("-"))
                 {
                     sign = -1;
-                    displayText = profitLoss + " 손실";
+                    displayText = profitLoss;
                 }
                 else if (state == "profit" || profitLoss.Contains("+") || (!profitLoss.Contains("-") && profitLoss != "$0"))
                 {
                     sign = 1;
                     string formatted = profitLoss.StartsWith("+") ? profitLoss : ("+" + profitLoss);
-                    displayText = formatted + " 수익";
+                    displayText = formatted;
                 }
                 else
                 {
                     sign = 0;
-                    displayText = profitLoss + " (본전)";
+                    displayText = profitLoss;
                 }
             }
             else
@@ -1037,7 +1037,7 @@ namespace WardogsProfitHudApp
             using (Font mainFont = new Font("맑은 고딕", fontSize, FontStyle.Bold))
             using (Font subFont = new Font("맑은 고딕", Math.Max(9f, fontSize * 0.68f), FontStyle.Bold))
             {
-                string prefix = sign > 0 ? "▲ " : (sign < 0 ? "▼ " : "● ");
+                string prefix = "";
                 SizeF mainSz = g.MeasureString(prefix + mainText, mainFont);
                 SizeF subSz = string.IsNullOrEmpty(deltaText) ? SizeF.Empty : g.MeasureString(deltaText, subFont);
 
@@ -1069,19 +1069,19 @@ namespace WardogsProfitHudApp
             {
                 mainColor = Color.FromArgb(46, 235, 122);
                 accentBorder = Color.FromArgb(40, 160, 88);
-                prefix = "▲ ";
+                prefix = "";
             }
             else if (sign < 0)
             {
                 mainColor = Color.FromArgb(255, 88, 88);
                 accentBorder = Color.FromArgb(180, 56, 56);
-                prefix = "▼ ";
+                prefix = "";
             }
             else
             {
                 mainColor = Color.FromArgb(220, 226, 236);
                 accentBorder = Color.FromArgb(65, 72, 84);
-                prefix = "● ";
+                prefix = "";
             }
 
             if (showBox)
