@@ -399,7 +399,7 @@ namespace WardogsProfitHudApp
             catch { }
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
             this.MaximizeBox = false;
-            this.ClientSize = new Size(320, 268);
+            this.ClientSize = new Size(320, 162);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.BackColor = Color.FromArgb(12, 12, 14);
             this.ForeColor = Color.FromArgb(168, 174, 184);
@@ -460,40 +460,11 @@ namespace WardogsProfitHudApp
 
         private void BuildUI()
         {
-            GroupBox grpStatus = new GroupBox()
-            {
-                Text = "스팀 실시간 연동 상태",
-                Font = new Font("맑은 고딕", 9f, FontStyle.Bold),
-                Location = new Point(14, 10),
-                Size = new Size(292, 102),
-                ForeColor = Color.FromArgb(158, 164, 174)
-            };
-
-            Panel pnlPreview = new Panel()
-            {
-                Location = new Point(12, 22),
-                Size = new Size(268, 46),
-                BackColor = Color.FromArgb(18, 18, 22),
-                BorderStyle = BorderStyle.FixedSingle
-            };
-
-            lblLiveValuePreview = new Label()
-            {
-                Dock = DockStyle.Fill,
-                TextAlign = ContentAlignment.MiddleCenter,
-                Font = new Font("맑은 고딕", 13f, FontStyle.Bold),
-                Text = "실시간 순손익 수집 중...",
-                ForeColor = Color.FromArgb(200, 206, 216)
-            };
-            pnlPreview.Controls.Add(lblLiveValuePreview);
-
-            grpStatus.Controls.Add(pnlPreview);
-
             GroupBox grpControls = new GroupBox()
             {
                 Text = "HUD 오버레이 설정 (F7: 표시 / F8: 위치잠금)",
                 Font = new Font("맑은 고딕", 9f, FontStyle.Bold),
-                Location = new Point(14, 98),
+                Location = new Point(14, 12),
                 Size = new Size(292, 138),
                 ForeColor = Color.FromArgb(158, 164, 174)
             };
@@ -575,7 +546,6 @@ namespace WardogsProfitHudApp
                 chkShowBox, chkControlTopMost
             });
 
-            this.Controls.Add(grpStatus);
             this.Controls.Add(grpControls);
             this.TopMost = chkControlTopMost.Checked;
         }
@@ -769,19 +739,12 @@ namespace WardogsProfitHudApp
 
         private void UpdateHudDisplay(string mainText, string deltaText, int sign)
         {
-            lblLiveValuePreview.Text = mainText;
-
-            if (sign > 0)
+            if (lblLiveValuePreview != null)
             {
-                lblLiveValuePreview.ForeColor = Color.FromArgb(46, 230, 118);
-            }
-            else if (sign < 0)
-            {
-                lblLiveValuePreview.ForeColor = Color.FromArgb(255, 85, 85);
-            }
-            else
-            {
-                lblLiveValuePreview.ForeColor = Color.FromArgb(205, 212, 222);
+                lblLiveValuePreview.Text = mainText;
+                if (sign > 0) lblLiveValuePreview.ForeColor = Color.FromArgb(46, 230, 118);
+                else if (sign < 0) lblLiveValuePreview.ForeColor = Color.FromArgb(255, 85, 85);
+                else lblLiveValuePreview.ForeColor = Color.FromArgb(205, 212, 222);
             }
 
             hudOverlay.UpdateContent(mainText, deltaText, sign);
