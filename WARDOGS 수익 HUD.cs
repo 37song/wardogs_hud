@@ -139,7 +139,7 @@ namespace WardogsProfitHudApp
             int currentPid = 0;
             long cachedAddr = 0;
 
-            byte[] pageBuf = new byte[1024 * 1024];
+            byte[] pageBuf = new byte[65536];
 
             while (isRunning)
             {
@@ -151,12 +151,11 @@ namespace WardogsProfitHudApp
                     {
                         if (hProc != IntPtr.Zero) { CloseHandle(hProc); hProc = IntPtr.Zero; currentPid = 0; }
                         cachedAddr = 0;
-                        lock (syncLock) { hasData = false; }
+                        lock (syncLock) { hasData = false; curVal = ""; curState = "frontend"; }
                         Thread.Sleep(1000);
                         continue;
                     }
 
-                    // 핵심 엔진: 게임의 패킷을 브라우저 힙 파편화 없이 순차 수신하는 코어 steam.exe 우선 스캔
                     int targetPid = 0;
                     if (steamPid != 0)
                     {
@@ -196,78 +195,71 @@ namespace WardogsProfitHudApp
                     string val = "", state = "";
                     long foundAddr = 0;
                     bool inGame = false;
-
-                    // 1. 활성 스트림 블록 국소 초고속 검사 (0.01ms)
                     bool ok = false;
+
+                    // 1. 캐시된 KeyValues 주소 국소 초고속 직접 읽기 (0.01ms)
                     if (cachedAddr > 0)
                     {
                         IntPtr nRead;
                         long readStart = Math.Max(0, cachedAddr - 64);
-                        if (ReadProcessMemory(hProc, (IntPtr)readStart, pageBuf, 4096, out nRead))
+                        if (ReadProcessMemory(hProc, (IntPtr)readStart, pageBuf, 256, out nRead) && (int)nRead > 64)
                         {
                             int bytesRead = (int)nRead;
-                            byte[] needle = Encoding.ASCII.GetBytes("steam_display");
-                            int idx = FindBytesSubReverse(pageBuf, 0, bytesRead, needle);
-                            if (idx != -1)
+                            string chunk = Encoding.ASCII.GetString(pageBuf, 0, bytesRead);
+
+                            if (chunk.Contains("#Status_KOTH") && (chunk.Contains("playing") || chunk.Contains("pre_match")))
                             {
-                                int start = Math.Max(0, idx - 80);
-                                int chunkLen = Math.Min(bytesRead - start, 300);
-                                string chunk = Encoding.ASCII.GetString(pageBuf, start, chunkLen);
-                                if (chunk.Contains("#Status_") || chunk.Contains("gamedata"))
+                                Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
+                                if (m.Success)
                                 {
-                                    foundAddr = readStart + idx;
-                                    cachedAddr = foundAddr;
+                                    val = m.Groups[1].Value.Replace(" ", "");
+                                    Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+                                    if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
+                                    else if (val.Contains("-")) state = "loss";
+                                    else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
 
-                                    if (chunk.Contains("#Status_Frontend") || chunk.Contains("Frontend") || !chunk.Contains("profit_loss"))
-                                    {
-                                        state = "frontend";
-                                        inGame = false;
-                                        val = "";
-                                        ok = true;
-                                    }
-                                    else
-                                    {
-                                        Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
-                                        if (m.Success)
-                                        {
-                                            val = m.Groups[1].Value.Replace(" ", "");
-                                            Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                            if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
-                                            else if (val.Contains("-")) state = "loss";
-                                            else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
-
-                                            inGame = true;
-                                            ok = true;
-                                        }
-                                    }
+                                    inGame = true;
+                                    ok = true;
                                 }
                             }
+                            else if (chunk.Contains("#Status_Frontend") || chunk.Contains("Frontend"))
+                            {
+                                state = "frontend";
+                                inGame = false;
+                                val = "";
+                                ok = true;
+                            }
+                        }
+
+                        if (!ok)
+                        {
+                            cachedAddr = 0;
                         }
                     }
 
-                    // 2. 새 스트림 페이지 할당 시 역방향 최상단 고속 스캔 (~24ms)
+                    // 2. 캐시가 없거나 유효하지 않은 경우 전체 가상 메모리에서 활성 Rich Presence KeyValues 스캔
                     if (!ok)
                     {
                         ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x40000000000L, pageBuf, out foundAddr, out val, out state, out inGame);
-                        if (ok && foundAddr > 0) cachedAddr = foundAddr;
+                        if (ok && foundAddr > 0 && inGame)
+                        {
+                            cachedAddr = foundAddr;
+                        }
                     }
 
-                    if (ok)
+                    lock (syncLock)
                     {
-                        lock (syncLock)
+                        if (inGame && !string.IsNullOrEmpty(val))
                         {
-                            if (inGame && !string.IsNullOrEmpty(val))
-                            {
-                                curVal = val;
-                                curState = state;
-                                hasData = true;
-                            }
-                            else
-                            {
-                                curVal = "";
-                                curState = state;
-                                hasData = false;
-                            }
+                            curVal = val;
+                            curState = state;
+                            hasData = true;
+                        }
+                        else
+                        {
+                            curVal = "";
+                            curState = state;
+                            hasData = false;
                         }
                     }
                 }
@@ -338,83 +330,78 @@ namespace WardogsProfitHudApp
         private bool ScanNativeStreamRange(IntPtr hProc, long startAddr, long endAddr, byte[] pageBuf, out long foundAddr, out string val, out string state, out bool inGame)
         {
             foundAddr = 0; val = ""; state = ""; inGame = false;
-            long addr = startAddr;
-            List<MemRegion> regions = new List<MemRegion>();
 
+            byte[] needle = Encoding.ASCII.GetBytes("\x01profit_loss\x00");
+
+            long addr = startAddr;
             while (addr < endAddr && isRunning)
             {
                 MEMORY_BASIC_INFORMATION mbi;
-                if (VirtualQueryEx(hProc, (IntPtr)addr, out mbi, Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION))) == 0) break;
+                if (VirtualQueryEx(hProc, (IntPtr)addr, out mbi, Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION))) == 0)
+                    break;
+
                 long baseAddr = (long)mbi.BaseAddress;
                 long size = (long)mbi.RegionSize;
                 if (size <= 0) break;
                 if (baseAddr == 0) baseAddr = addr;
 
-                if (mbi.State == 0x1000 && (mbi.Protect & 0x04) != 0 && (mbi.Protect & 0x100) == 0 && size >= 4096 && size <= 20 * 1024 * 1024)
+                if (mbi.State == 0x1000 && (mbi.Protect == 0x04 || mbi.Protect == 0x02 || mbi.Protect == 0x08))
                 {
-                    regions.Add(new MemRegion { Base = baseAddr, Size = size });
+                    long offset = 0;
+                    while (offset < size && isRunning)
+                    {
+                        int toRead = (int)Math.Min((long)pageBuf.Length, size - offset);
+                        IntPtr nRead;
+                        if (ReadProcessMemory(hProc, (IntPtr)(baseAddr + offset), pageBuf, toRead, out nRead))
+                        {
+                            int bytesRead = (int)nRead;
+                            for (int i = 0; i <= bytesRead - needle.Length; i++)
+                            {
+                                if (pageBuf[i] == needle[0] && pageBuf[i + 1] == needle[1] && pageBuf[i + needle.Length - 1] == 0)
+                                {
+                                    bool match = true;
+                                    for (int k = 2; k < needle.Length - 1; k++)
+                                    {
+                                        if (pageBuf[i + k] != needle[k]) { match = false; break; }
+                                    }
+                                    if (match)
+                                    {
+                                        int chunkStart = Math.Max(0, i - 60);
+                                        int chunkLen = Math.Min(bytesRead - chunkStart, 160);
+                                        string chunk = Encoding.ASCII.GetString(pageBuf, chunkStart, chunkLen);
+
+                                        if (chunk.Contains("#Status_KOTH") && (chunk.Contains("playing") || chunk.Contains("pre_match")))
+                                        {
+                                            foundAddr = baseAddr + offset + i;
+                                            int valStart = i + needle.Length;
+                                            int valEnd = valStart;
+                                            while (valEnd < bytesRead && pageBuf[valEnd] != 0) valEnd++;
+                                            val = Encoding.ASCII.GetString(pageBuf, valStart, valEnd - valStart).Trim();
+
+                                            Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+                                            if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
+                                            else if (val.Contains("-")) state = "loss";
+                                            else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
+
+                                            inGame = true;
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        offset += toRead;
+                    }
                 }
                 long nextAddr = baseAddr + size;
                 if (nextAddr <= addr) break;
                 addr = nextAddr;
             }
 
-            byte[] needle = Encoding.ASCII.GetBytes("steam_display");
-
-            for (int r = regions.Count - 1; r >= 0 && isRunning; r--)
-            {
-                MemRegion reg = regions[r];
-                long offset = reg.Size;
-                while (offset > 0 && isRunning)
-                {
-                    int chunkToRead = (int)Math.Min((long)pageBuf.Length, offset);
-                    long chunkStart = reg.Base + (offset - chunkToRead);
-                    IntPtr nRead;
-                    if (ReadProcessMemory(hProc, (IntPtr)chunkStart, pageBuf, chunkToRead, out nRead))
-                    {
-                        int bytesRead = (int)nRead;
-                        int idx = FindBytesSubReverse(pageBuf, 0, bytesRead, needle);
-                        while (idx != -1 && isRunning)
-                        {
-                            int start = Math.Max(0, idx - 80);
-                            int chunkLen = Math.Min(bytesRead - start, 300);
-                            string chunk = Encoding.ASCII.GetString(pageBuf, start, chunkLen);
-
-                            if (chunk.Contains("#Status_") || chunk.Contains("gamedata"))
-                            {
-                                foundAddr = chunkStart + idx;
-
-                                // 로비/메인메뉴 상태 (#Status_Frontend 또는 방에 입장하지 않아 profit_loss가 없는 대기 상태)
-                                if (chunk.Contains("#Status_Frontend") || chunk.Contains("Frontend") || !chunk.Contains("profit_loss"))
-                                {
-                                    state = "frontend";
-                                    inGame = false;
-                                    val = "";
-                                    return true;
-                                }
-
-                                // 경기 중 실시간 profit_loss 패킷
-                                Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
-                                if (m.Success)
-                                {
-                                    val = m.Groups[1].Value.Replace(" ", "");
-                                    Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                    if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
-                                    else if (val.Contains("-")) state = "loss";
-                                    else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
-
-                                    inGame = true;
-                                    return true;
-                                }
-                            }
-                            idx = (idx > 0) ? FindBytesSubReverse(pageBuf, 0, idx, needle) : -1;
-                        }
-                    }
-                    offset -= chunkToRead;
-                }
-            }
-
-            return false;
+            state = "frontend";
+            inGame = false;
+            val = "";
+            return true;
         }
 
         private static int FindBytesSubReverse(byte[] src, int startIdx, int count, byte[] needle)
