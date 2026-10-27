@@ -156,17 +156,33 @@ namespace WardogsProfitHudApp
                         continue;
                     }
 
-                    Process targetRenderer = FindTargetRenderer();
-                    if (targetRenderer == null)
+                    // 핵심 엔진: 게임의 패킷을 브라우저 힙 파편화 없이 순차 수신하는 코어 steam.exe 우선 스캔
+                    int targetPid = 0;
+                    if (steamPid != 0)
+                    {
+                        try
+                        {
+                            Process sp = Process.GetProcessById(steamPid);
+                            if (!sp.HasExited) targetPid = steamPid;
+                        }
+                        catch { }
+                    }
+                    if (targetPid == 0)
+                    {
+                        Process targetRenderer = FindTargetRenderer();
+                        if (targetRenderer != null) targetPid = targetRenderer.Id;
+                    }
+
+                    if (targetPid == 0)
                     {
                         Thread.Sleep(500);
                         continue;
                     }
 
-                    if (targetRenderer.Id != currentPid || hProc == IntPtr.Zero)
+                    if (targetPid != currentPid || hProc == IntPtr.Zero)
                     {
                         if (hProc != IntPtr.Zero) CloseHandle(hProc);
-                        currentPid = targetRenderer.Id;
+                        currentPid = targetPid;
                         hProc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, currentPid);
                         cachedAddr = 0;
                     }
@@ -180,10 +196,48 @@ namespace WardogsProfitHudApp
                     string val = "", state = "";
                     long foundAddr = 0;
 
-                    // 최신성 보장: 항상 최상단 역방향 고속 스캔 (~100ms)
-                    // 역방향 스캔은 가장 높은 메모리 주소(최신 활성 버퍼)부터 아래로 탐색하여
-                    // 첫 매칭 시 즉시 탈출하므로, 과거 캐시 주소에 갇히지 않고 100% 최신 수치만 가져옵니다.
-                    bool ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x30000000000L, pageBuf, out foundAddr, out val, out state);
+                    // 1. 활성 스트림 블록 국소 초고속 검사 (0.01ms)
+                    bool ok = false;
+                    if (cachedAddr > 0)
+                    {
+                        IntPtr nRead;
+                        long readStart = Math.Max(0, cachedAddr - 64);
+                        if (ReadProcessMemory(hProc, (IntPtr)readStart, pageBuf, 4096, out nRead))
+                        {
+                            int bytesRead = (int)nRead;
+                            byte[] needle = Encoding.ASCII.GetBytes("profit_loss");
+                            int idx = FindBytesSubReverse(pageBuf, 0, bytesRead, needle);
+                            if (idx != -1)
+                            {
+                                int start = Math.Max(0, idx - 120);
+                                int chunkLen = Math.Min(bytesRead - start, 300);
+                                string chunk = Encoding.ASCII.GetString(pageBuf, start, chunkLen);
+                                if (chunk.Contains("Status_KOTH") || chunk.Contains("steam_display") || chunk.Contains("in_profit_or_loss"))
+                                {
+                                    Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
+                                    if (m.Success)
+                                    {
+                                        val = m.Groups[1].Value.Replace(" ", "");
+                                        Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+                                        if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
+                                        else if (val.Contains("-")) state = "loss";
+                                        else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
+
+                                        foundAddr = readStart + idx;
+                                        cachedAddr = foundAddr;
+                                        ok = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 2. 새 스트림 페이지 할당 시 역방향 최상단 고속 스캔 (~40ms)
+                    if (!ok)
+                    {
+                        ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x40000000000L, pageBuf, out foundAddr, out val, out state);
+                        if (ok && foundAddr > 0) cachedAddr = foundAddr;
+                    }
 
                     if (ok && !string.IsNullOrEmpty(val))
                     {
@@ -241,7 +295,7 @@ namespace WardogsProfitHudApp
             }
             catch { }
 
-            IsSteamRunning = steamPid != 0 && Process.GetProcessesByName("steamwebhelper").Length > 0;
+            IsSteamRunning = steamPid != 0 && (Process.GetProcessesByName("steam").Length > 0 || Process.GetProcessesByName("steamwebhelper").Length > 0);
 
             bool wardogsFound = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Length > 0;
             if (!wardogsFound)
@@ -305,7 +359,7 @@ namespace WardogsProfitHudApp
                             string chunk = Encoding.ASCII.GetString(pageBuf, start, chunkLen);
 
                             // 스팀 챗/친구창의 최신 실시간 WARDOGS Rich Presence 검증
-                            if (!chunk.Contains("HIST") && (chunk.Contains("steam_display") || chunk.Contains("in_profit_or_loss") || chunk.Contains("gamedata")))
+                            if (chunk.Contains("Status_KOTH") || chunk.Contains("steam_display") || chunk.Contains("in_profit_or_loss"))
                             {
                                 Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
                                 if (m.Success)
