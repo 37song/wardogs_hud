@@ -399,7 +399,7 @@ namespace WardogsProfitHudApp
             catch { }
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
             this.MaximizeBox = false;
-            this.ClientSize = new Size(320, 162);
+            this.ClientSize = new Size(320, 224);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.BackColor = Color.FromArgb(12, 12, 14);
             this.ForeColor = Color.FromArgb(168, 174, 184);
@@ -460,11 +460,31 @@ namespace WardogsProfitHudApp
 
         private void BuildUI()
         {
+            // 상단: 수익 숫자 나오던 네모 박스 복원
+            Panel pnlPreview = new Panel()
+            {
+                Location = new Point(14, 12),
+                Size = new Size(292, 52),
+                BackColor = Color.FromArgb(18, 18, 22),
+                BorderStyle = BorderStyle.FixedSingle
+            };
+
+            lblLiveValuePreview = new Label()
+            {
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleCenter,
+                Font = new Font("맑은 고딕", 15f, FontStyle.Bold),
+                Text = "실시간 순손익 수집 중...",
+                ForeColor = Color.FromArgb(200, 206, 216)
+            };
+            pnlPreview.Controls.Add(lblLiveValuePreview);
+
+            // 하단: HUD 오버레이 설정
             GroupBox grpControls = new GroupBox()
             {
                 Text = "HUD 오버레이 설정 (F7: 표시 / F8: 위치잠금)",
                 Font = new Font("맑은 고딕", 9f, FontStyle.Bold),
-                Location = new Point(14, 12),
+                Location = new Point(14, 72),
                 Size = new Size(292, 138),
                 ForeColor = Color.FromArgb(158, 164, 174)
             };
@@ -546,6 +566,7 @@ namespace WardogsProfitHudApp
                 chkShowBox, chkControlTopMost
             });
 
+            this.Controls.Add(pnlPreview);
             this.Controls.Add(grpControls);
             this.TopMost = chkControlTopMost.Checked;
         }
