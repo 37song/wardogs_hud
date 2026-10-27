@@ -72,31 +72,6 @@ namespace WardogsProfitHudApp
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern int VirtualQueryEx(IntPtr hProcess, IntPtr lpAddress, out MEMORY_BASIC_INFORMATION lpBuffer, int dwLength);
 
-        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
-        private struct PROCESSENTRY32
-        {
-            public uint dwSize;
-            public uint cntUsage;
-            public uint th32ProcessID;
-            public IntPtr th32DefaultHeapID;
-            public uint th32ModuleID;
-            public uint cntThreads;
-            public uint th32ParentProcessID;
-            public int pcPriClassBase;
-            public uint dwFlags;
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
-            public string szExeFile;
-        }
-
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-        private static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
-
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-        private static extern bool Process32First(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
-
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-        private static extern bool Process32Next(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
-
         [StructLayout(LayoutKind.Sequential)]
         private struct MEMORY_BASIC_INFORMATION
         {
@@ -163,9 +138,7 @@ namespace WardogsProfitHudApp
             IntPtr hProc = IntPtr.Zero;
             int currentPid = 0;
             long cachedAddr = 0;
-            DateTime lastScanTime = DateTime.MinValue;
 
-            byte[] fastBuf = new byte[1024];
             byte[] pageBuf = new byte[2 * 1024 * 1024];
 
             while (isRunning)
@@ -183,31 +156,20 @@ namespace WardogsProfitHudApp
                         continue;
                     }
 
-                    // 1. 대상 프로세스 선정: steam.exe 우선, 없으면 steamwebhelper
-                    int targetPid = 0;
-                    if (steamPid != 0 && ProcessExists(steamPid, "steam"))
-                    {
-                        targetPid = steamPid;
-                    }
-                    else
-                    {
-                        Process helper = FindTargetHelper(steamPid);
-                        if (helper != null) targetPid = helper.Id;
-                    }
-
-                    if (targetPid == 0)
+                    // 스팀챗/친구창을 렌더링하는 steamwebhelper 렌더러 프로세스 타겟팅
+                    Process targetRenderer = FindTargetRenderer();
+                    if (targetRenderer == null)
                     {
                         Thread.Sleep(500);
                         continue;
                     }
 
-                    if (targetPid != currentPid || hProc == IntPtr.Zero)
+                    if (targetRenderer.Id != currentPid || hProc == IntPtr.Zero)
                     {
                         if (hProc != IntPtr.Zero) CloseHandle(hProc);
-                        currentPid = targetPid;
+                        currentPid = targetRenderer.Id;
                         hProc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, currentPid);
                         cachedAddr = 0;
-                        lastScanTime = DateTime.MinValue;
                     }
 
                     if (hProc == IntPtr.Zero)
@@ -216,67 +178,35 @@ namespace WardogsProfitHudApp
                         continue;
                     }
 
-                    bool readSuccess = false;
+                    string val = "", state = "", game = "", faction = "";
+                    long foundAddr = 0;
+                    bool ok = false;
 
-                    // 2. 빠른 경로: 이전에 찾은 주소에서 즉시 읽기 (< 0.1ms)
+                    // 1. 빠른 경로: 캐시된 주소 주변 24MB 고속 역방향 스캔 (~50ms)
                     if (cachedAddr != 0)
                     {
-                        IntPtr nRead;
-                        long readStart = Math.Max(0, cachedAddr - 120);
-                        if (ReadProcessMemory(hProc, (IntPtr)readStart, fastBuf, 600, out nRead) && (int)nRead > 150)
-                        {
-                            string text = Encoding.ASCII.GetString(fastBuf, 0, (int)nRead);
-                            if (text.Contains("profit_loss") && (text.Contains("#Status_") || text.Contains("in_profit_or_loss")))
-                            {
-                                string val, state, game, faction;
-                                if (TryParseChunk(text, out val, out state, out game, out faction))
-                                {
-                                    lock (syncLock)
-                                    {
-                                        curVal = val;
-                                        curState = state;
-                                        curGame = game;
-                                        curFaction = faction;
-                                        hasData = true;
-                                    }
-                                    readSuccess = true;
-                                }
-                            }
-                        }
+                        long start = Math.Max(0, cachedAddr - (8 * 1024 * 1024));
+                        long end = cachedAddr + (16 * 1024 * 1024);
+                        ok = ReverseScanRange(hProc, start, end, pageBuf, out foundAddr, out val, out state, out game, out faction);
+                        if (ok) cachedAddr = foundAddr;
                     }
 
-                    // 3. 캐시가 없거나, 주기적(1.2초마다) 역방향 고속 재스캔 (새 패킷 버퍼 할당 및 사망 시 즉시 감지)
-                    if (!readSuccess || (DateTime.UtcNow - lastScanTime).TotalSeconds >= 1.2)
+                    // 2. 캐시가 없거나 범위를 벗어난 경우: 전체 메모리 역방향 스캔
+                    if (!ok)
                     {
-                        long foundAddr;
-                        string val, state, game, faction;
-                        if (ReverseScan(hProc, pageBuf, out foundAddr, out val, out state, out game, out faction))
-                        {
-                            cachedAddr = foundAddr;
-                            lastScanTime = DateTime.UtcNow;
-                            lock (syncLock)
-                            {
-                                curVal = val;
-                                curState = state;
-                                curGame = game;
-                                curFaction = faction;
-                                hasData = true;
-                            }
-                            readSuccess = true;
-                        }
+                        ok = ReverseScanRange(hProc, 0, 0x7FFFFFFF0000L, pageBuf, out foundAddr, out val, out state, out game, out faction);
+                        if (ok) cachedAddr = foundAddr;
                     }
 
-                    // steam.exe에서 못 찾았다면 steamwebhelper로 전환 시도
-                    if (!readSuccess && currentPid == steamPid)
+                    if (ok && !string.IsNullOrEmpty(val))
                     {
-                        Process helper = FindTargetHelper(steamPid);
-                        if (helper != null && helper.Id != steamPid)
+                        lock (syncLock)
                         {
-                            CloseHandle(hProc);
-                            currentPid = helper.Id;
-                            hProc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, currentPid);
-                            cachedAddr = 0;
-                            lastScanTime = DateTime.MinValue;
+                            curVal = val;
+                            curState = state;
+                            curGame = game;
+                            curFaction = faction;
+                            hasData = true;
                         }
                     }
                 }
@@ -288,14 +218,25 @@ namespace WardogsProfitHudApp
             if (hProc != IntPtr.Zero) CloseHandle(hProc);
         }
 
-        private static bool ProcessExists(int pid, string expectedName)
+        private static Process FindTargetRenderer()
         {
-            try
+            Process[] helpers = Process.GetProcessesByName("steamwebhelper");
+            if (helpers == null || helpers.Length == 0) return null;
+            Process best = null;
+            long maxWs = 0;
+            foreach (Process p in helpers)
             {
-                Process p = Process.GetProcessById(pid);
-                return p != null && !p.HasExited && p.ProcessName.IndexOf(expectedName, StringComparison.OrdinalIgnoreCase) >= 0;
+                try
+                {
+                    if (p.WorkingSet64 > maxWs)
+                    {
+                        maxWs = p.WorkingSet64;
+                        best = p;
+                    }
+                }
+                catch { }
             }
-            catch { return false; }
+            return best;
         }
 
         private void CheckProcesses(out int steamPid, ref ulong steamId64)
@@ -315,7 +256,7 @@ namespace WardogsProfitHudApp
             }
             catch { }
 
-            IsSteamRunning = steamPid != 0 && ProcessExists(steamPid, "steam");
+            IsSteamRunning = steamPid != 0 && Process.GetProcessesByName("steamwebhelper").Length > 0;
 
             bool wardogsFound = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Length > 0;
             if (!wardogsFound)
@@ -333,41 +274,7 @@ namespace WardogsProfitHudApp
             IsWardogsRunning = wardogsFound;
         }
 
-        private Process FindTargetHelper(int steamPid)
-        {
-            if (steamPid != 0)
-            {
-                try
-                {
-                    IntPtr hSnap = CreateToolhelp32Snapshot(0x00000002, 0); // TH32CS_SNAPPROCESS
-                    if (hSnap != IntPtr.Zero && hSnap != new IntPtr(-1))
-                    {
-                        PROCESSENTRY32 pe = new PROCESSENTRY32();
-                        pe.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
-                        if (Process32First(hSnap, ref pe))
-                        {
-                            do
-                            {
-                                if (string.Equals(pe.szExeFile, "steamwebhelper.exe", StringComparison.OrdinalIgnoreCase) &&
-                                    pe.th32ParentProcessID == (uint)steamPid)
-                                {
-                                    CloseHandle(hSnap);
-                                    return Process.GetProcessById((int)pe.th32ProcessID);
-                                }
-                            } while (Process32Next(hSnap, ref pe));
-                        }
-                        CloseHandle(hSnap);
-                    }
-                }
-                catch { }
-            }
-
-            Process[] procs = Process.GetProcessesByName("steamwebhelper");
-            if (procs == null || procs.Length == 0) return null;
-            return procs[0];
-        }
-
-        private bool ReverseScan(IntPtr hProc, byte[] pageBuf, out long foundAddr, out string val, out string state, out string game, out string faction)
+        private bool ReverseScanRange(IntPtr hProc, long startAddr, long endAddr, byte[] pageBuf, out long foundAddr, out string val, out string state, out string game, out string faction)
         {
             foundAddr = 0;
             val = "";
@@ -375,10 +282,10 @@ namespace WardogsProfitHudApp
             game = "";
             faction = "";
 
-            long addr = 0;
+            long addr = startAddr;
             List<MemRegion> regions = new List<MemRegion>();
 
-            while (addr < 0x7FFFFFFF0000L && isRunning)
+            while (addr < endAddr && isRunning)
             {
                 MEMORY_BASIC_INFORMATION mbi;
                 if (VirtualQueryEx(hProc, (IntPtr)addr, out mbi, Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION))) == 0) break;
@@ -387,7 +294,7 @@ namespace WardogsProfitHudApp
                 if (size <= 0) break;
                 if (baseAddr == 0) baseAddr = addr;
 
-                if (mbi.State == 0x1000 && (mbi.Protect & 0x04) != 0 && (mbi.Protect & 0x100) == 0)
+                if (mbi.State == 0x1000 && (mbi.Protect & 0x04) != 0 && (mbi.Protect & 0x100) == 0 && size < 50 * 1024 * 1024)
                 {
                     regions.Add(new MemRegion { Base = baseAddr, Size = size });
                 }
@@ -414,17 +321,14 @@ namespace WardogsProfitHudApp
                         int idx = FindBytesSubReverse(pageBuf, 0, bytesRead, needle);
                         while (idx != -1 && isRunning)
                         {
-                            int start = Math.Max(0, idx - 80);
-                            int chunkLen = Math.Min(bytesRead - start, 500);
+                            int start = Math.Max(0, idx - 60);
+                            int chunkLen = Math.Min(bytesRead - start, 300);
                             string chunk = Encoding.ASCII.GetString(pageBuf, start, chunkLen);
 
-                            if (chunk.Contains("#Status_") || chunk.Contains("in_profit_or_loss") || chunk.Contains("steam_display"))
+                            if (TryParseChunk(chunk, out val, out state, out game, out faction))
                             {
-                                if (TryParseChunk(chunk, out val, out state, out game, out faction))
-                                {
-                                    foundAddr = chunkStart + idx;
-                                    return true;
-                                }
+                                foundAddr = chunkStart + idx;
+                                return true;
                             }
                             idx = (idx > 0) ? FindBytesSubReverse(pageBuf, 0, idx, needle) : -1;
                         }
@@ -465,6 +369,8 @@ namespace WardogsProfitHudApp
 
             Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
             if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
+            else if (val.Contains("-")) state = "loss";
+            else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
 
             Match mg = Regex.Match(chunk, @"game_state[^\w]*(\w+)", RegexOptions.IgnoreCase);
             if (mg.Success) game = mg.Groups[1].Value.ToLowerInvariant();
@@ -900,7 +806,7 @@ namespace WardogsProfitHudApp
                     : string.Format("(-${0:N0})", Math.Abs(lastDeltaValue));
             }
 
-            UpdateHudDisplay(displayText, deltaText, sign);
+            UpdateHudDisplay(displayText, "", sign);
         }
 
         private static bool TryExtractSignedAmount(string text, int sign, out long amount)
@@ -926,7 +832,7 @@ namespace WardogsProfitHudApp
 
         private void UpdateHudDisplay(string mainText, string deltaText, int sign)
         {
-            lblLiveValuePreview.Text = string.IsNullOrEmpty(deltaText) ? mainText : (mainText + "  " + deltaText);
+            lblLiveValuePreview.Text = mainText;
 
             if (sign > 0)
             {
