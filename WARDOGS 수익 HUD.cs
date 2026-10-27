@@ -138,6 +138,7 @@ namespace WardogsProfitHudApp
             IntPtr hProc = IntPtr.Zero;
             int currentPid = 0;
             long cachedAddr = 0;
+            int refreshTick = 0;
 
             byte[] pageBuf = new byte[65536];
 
@@ -146,6 +147,7 @@ namespace WardogsProfitHudApp
                 try
                 {
                     CheckProcesses(out steamPid, ref steamId64);
+                    if (++refreshTick % 4 == 0) cachedAddr = 0; // 1초마다 최신 주소 자동 재스캔 (과거 $0 고착 원천 방지)
 
                     if (!IsSteamRunning)
                     {
@@ -331,6 +333,10 @@ namespace WardogsProfitHudApp
 
             byte[] needle = new byte[] { (byte)'R', (byte)'P', 0x00, 0x01, (byte)'s', (byte)'t', (byte)'e', (byte)'a', (byte)'m', (byte)'_', (byte)'d', (byte)'i', (byte)'s', (byte)'p', (byte)'l', (byte)'a', (byte)'y', 0x00 };
 
+            long bestAddr = 0;
+            string bestVal = "", bestState = "";
+            bool bestInGame = false;
+
             long addr = startAddr;
 
             while (addr < endAddr && isRunning)
@@ -373,24 +379,23 @@ namespace WardogsProfitHudApp
                                             Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
                                             if (m.Success)
                                             {
-                                                foundAddr = baseAddr + offset + i;
-                                                val = m.Groups[1].Value.Replace(" ", "");
+                                                // 과거 주소를 덮어쓰고 가장 최신(가장 큰 주소) 레코드를 항상 선택!
+                                                bestAddr = baseAddr + offset + i;
+                                                bestVal = m.Groups[1].Value.Replace(" ", "");
                                                 Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                                if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
-                                                else if (val.Contains("-")) state = "loss";
-                                                else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
+                                                if (ms.Success) bestState = ms.Groups[1].Value.ToLowerInvariant();
+                                                else if (bestVal.Contains("-")) bestState = "loss";
+                                                else if (bestVal.Contains("+") || (!bestVal.Contains("-") && bestVal != "$0")) bestState = "profit";
 
-                                                inGame = true;
-                                                return true;
+                                                bestInGame = true;
                                             }
                                         }
                                         else if (chunk.Contains("#Status_Frontend") || chunk.Contains("Frontend"))
                                         {
-                                            foundAddr = baseAddr + offset + i;
-                                            state = "frontend";
-                                            inGame = false;
-                                            val = "";
-                                            return true;
+                                            bestAddr = baseAddr + offset + i;
+                                            bestState = "frontend";
+                                            bestInGame = false;
+                                            bestVal = "";
                                         }
                                     }
                                 }
@@ -402,6 +407,15 @@ namespace WardogsProfitHudApp
                 long nextAddr = baseAddr + size;
                 if (nextAddr <= addr) break;
                 addr = nextAddr;
+            }
+
+            if (bestAddr > 0)
+            {
+                foundAddr = bestAddr;
+                val = bestVal;
+                state = bestState;
+                inGame = bestInGame;
+                return true;
             }
 
             state = "frontend";
