@@ -458,7 +458,8 @@ namespace WardogsProfitHudApp
                 addr = nextAddr;
             }
 
-            if (latestMatchAddr > 0 && !string.IsNullOrEmpty(latestMatchVal) && maxMatchTs >= maxIdleTs)
+            bool matchIsNewer = (maxMatchTs > maxIdleTs) || (maxMatchTs == maxIdleTs && latestMatchAddr > latestIdleAddr);
+            if (matchIsNewer && latestMatchAddr > 0 && !string.IsNullOrEmpty(latestMatchVal))
             {
                 foundAddr = latestMatchAddr;
                 val = latestMatchVal;
