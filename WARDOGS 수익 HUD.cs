@@ -179,13 +179,23 @@ namespace WardogsProfitHudApp
 
                     string val = "", state = "";
                     long foundAddr = 0;
+                    bool ok = false;
 
-                    // 알트탭 캐시 트랩 방지: 항상 네이티브 스트림 최상단 역방향 고속 스캔 (~150ms).
-                    // 역방향 스캔은 가장 높은 메모리 주소(최신 패킷)부터 아래로 탐색하므로,
-                    // 첫 매칭 시 즉시 탈출하여 항상 100% 최신 패킷을 가져오며 알트탭 시에도 캐시 갇힘(Trap) 현상이 발생하지 않습니다.
-                    bool ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x30000000000L, pageBuf, out foundAddr, out val, out state);
+                    // 1. 빠른 경로: 캐시 주소 앞뒤 1MB 검사 (< 2ms)
+                    if (cachedAddr != 0)
+                    {
+                        long start = Math.Max(0x10000000000L, cachedAddr - (512 * 1024));
+                        long end = cachedAddr + (1024 * 1024);
+                        ok = ScanNativeStreamRange(hProc, start, end, pageBuf, out foundAddr, out val, out state);
+                        if (ok) cachedAddr = foundAddr;
+                    }
 
-
+                    // 2. 전체 네이티브 수신 스트림 역방향 고속 스캔 (~150ms)
+                    if (!ok)
+                    {
+                        ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x30000000000L, pageBuf, out foundAddr, out val, out state);
+                        if (ok) cachedAddr = foundAddr;
+                    }
 
                     if (ok && !string.IsNullOrEmpty(val))
                     {
@@ -199,7 +209,7 @@ namespace WardogsProfitHudApp
                 }
                 catch { }
 
-                Thread.Sleep(50);
+                Thread.Sleep(250);
             }
 
             if (hProc != IntPtr.Zero) CloseHandle(hProc);
@@ -306,22 +316,17 @@ namespace WardogsProfitHudApp
                             int chunkLen = Math.Min(bytesRead - start, 300);
                             string chunk = Encoding.ASCII.GetString(pageBuf, start, chunkLen);
 
-                            // WARDOGS Rich Presence 패킷인지 철저히 검증 (알트탭 시 타 버퍼 간섭 방지)
-                            bool isWardogsRP = (chunk.Contains("in_profit_or_loss") || chunk.Contains("steam_display") || chunk.Contains("#Status_"));
-                            if (isWardogsRP)
+                            Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
+                            if (m.Success)
                             {
-                                Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
-                                if (m.Success)
-                                {
-                                    val = m.Groups[1].Value.Trim();
-                                    Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                    if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
-                                    else if (val.Contains("-")) state = "loss";
-                                    else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
+                                val = m.Groups[1].Value.Trim();
+                                Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+                                if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
+                                else if (val.Contains("-")) state = "loss";
+                                else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
 
-                                    foundAddr = chunkStart + idx;
-                                    return true;
-                                }
+                                foundAddr = chunkStart + idx;
+                                return true;
                             }
                             idx = (idx > 0) ? FindBytesSubReverse(pageBuf, 0, idx, needle) : -1;
                         }
