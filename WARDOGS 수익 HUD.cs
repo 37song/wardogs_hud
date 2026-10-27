@@ -330,12 +330,8 @@ namespace WardogsProfitHudApp
             foundAddr = 0; val = ""; state = ""; inGame = false;
 
             byte[] needle = new byte[] { (byte)'R', (byte)'P', 0x00, 0x01, (byte)'s', (byte)'t', (byte)'e', (byte)'a', (byte)'m', (byte)'_', (byte)'d', (byte)'i', (byte)'s', (byte)'p', (byte)'l', (byte)'a', (byte)'y', 0x00 };
-            byte[] jaTag = new byte[] { (byte)'J', (byte)'A', (byte)'=', (byte)'=' };
 
             long addr = startAddr;
-            long fallbackAddr = 0;
-            string fallbackVal = "", fallbackState = "";
-            bool fallbackInGame = false;
 
             while (addr < endAddr && isRunning)
             {
@@ -369,60 +365,32 @@ namespace WardogsProfitHudApp
                                     }
                                     if (match)
                                     {
-                                        int preStart = Math.Max(0, i - 40);
-                                        bool hasJa = false;
-                                        for (int j = preStart; j <= i - 4; j++)
-                                        {
-                                            if (pageBuf[j] == jaTag[0] && pageBuf[j+1] == jaTag[1] && pageBuf[j+2] == jaTag[2] && pageBuf[j+3] == jaTag[3])
-                                            {
-                                                hasJa = true;
-                                                break;
-                                            }
-                                        }
-
                                         int chunkLen = Math.Min(bytesRead - i, 200);
                                         string chunk = Encoding.ASCII.GetString(pageBuf, i, chunkLen);
 
-                                        if (hasJa)
-                                        {
-                                            // 1순위: 로컬 유저 전용 고유 Rich Presence 버퍼
-                                            foundAddr = baseAddr + offset + i;
-                                            if (chunk.Contains("#Status_KOTH") && (chunk.Contains("playing") || chunk.Contains("pre_match")))
-                                            {
-                                                Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
-                                                if (m.Success)
-                                                {
-                                                    val = m.Groups[1].Value.Replace(" ", "");
-                                                    Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                                    if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
-                                                    else if (val.Contains("-")) state = "loss";
-                                                    else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
-
-                                                    inGame = true;
-                                                    return true;
-                                                }
-                                            }
-                                            else if (chunk.Contains("#Status_Frontend") || chunk.Contains("Frontend"))
-                                            {
-                                                state = "frontend";
-                                                inGame = false;
-                                                val = "";
-                                                return true;
-                                            }
-                                        }
-                                        else if (fallbackAddr == 0 && chunk.Contains("#Status_KOTH"))
+                                        if (chunk.Contains("#Status_KOTH") && (chunk.Contains("playing") || chunk.Contains("pre_match")))
                                         {
                                             Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
                                             if (m.Success)
                                             {
-                                                fallbackAddr = baseAddr + offset + i;
-                                                fallbackVal = m.Groups[1].Value.Replace(" ", "");
+                                                foundAddr = baseAddr + offset + i;
+                                                val = m.Groups[1].Value.Replace(" ", "");
                                                 Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                                if (ms.Success) fallbackState = ms.Groups[1].Value.ToLowerInvariant();
-                                                else if (fallbackVal.Contains("-")) fallbackState = "loss";
-                                                else if (fallbackVal.Contains("+") || (!fallbackVal.Contains("-") && fallbackVal != "$0")) fallbackState = "profit";
-                                                fallbackInGame = true;
+                                                if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
+                                                else if (val.Contains("-")) state = "loss";
+                                                else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
+
+                                                inGame = true;
+                                                return true;
                                             }
+                                        }
+                                        else if (chunk.Contains("#Status_Frontend") || chunk.Contains("Frontend"))
+                                        {
+                                            foundAddr = baseAddr + offset + i;
+                                            state = "frontend";
+                                            inGame = false;
+                                            val = "";
+                                            return true;
                                         }
                                     }
                                 }
@@ -436,19 +404,10 @@ namespace WardogsProfitHudApp
                 addr = nextAddr;
             }
 
-            if (fallbackAddr > 0)
-            {
-                foundAddr = fallbackAddr;
-                val = fallbackVal;
-                state = fallbackState;
-                inGame = fallbackInGame;
-                return true;
-            }
-
             state = "frontend";
             inGame = false;
             val = "";
-            return true;
+            return false;
         }
 
         private static int FindBytesSubReverse(byte[] src, int startIdx, int count, byte[] needle)
