@@ -64,4 +64,9 @@
 본 프로그램이 유용하셨다면 개발자에게 따뜻한 커피 한 잔을 선물해 주세요!  
 보내주신 응원은 지속적인 업데이트와 프로그램 유지 관리에 큰 힘이 됩니다.
 
-[![KakaoPay 후원하기](https://img.shields.io/badge/KakaoPay-후원하기-FFCD00?style=for-the-badge&logo=kakaotalk&logoColor=black)](https://qr.kakaopay.com/Ej7jxWIW1)
+<br>
+
+<img src="./kakaopay_qr.png" width="170" alt="카카오페이 송금 QR코드" />
+
+* **PC 사용자**: 스마트폰 카메라 앱 또는 카카오톡으로 위 **QR코드를 스캔**하시면 즉시 송금 화면이 열립니다.
+* **스마트폰 사용자**: **[📱 카카오페이 송금 바로가기](https://qr.kakaopay.com/Ej7jxWIW1)** 터치 시 카카오톡 송금창으로 바로 이동합니다.
