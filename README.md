@@ -1,5 +1,8 @@
 # WARDOGS 수익 HUD (Profit Overlay HUD)
 
+[![GitHub Release](https://img.shields.io/github/v/release/37song/wardogs_hud?color=brightgreen&label=%EB%B2%84%EC%A0%84)](https://github.com/37song/wardogs_hud/releases/latest)
+[![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/37song/wardogs_hud/total?color=blue&label=%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C%20%EC%88%98&logo=github)](https://github.com/37song/wardogs_hud/releases)
+
 스팀(Steam) 게임 **WARDOGS**의 실시간 매치 순손익을 화면 위에 오버레이로 띄워주는 경량 실시간 HUD 프로그램입니다.
 
 ---

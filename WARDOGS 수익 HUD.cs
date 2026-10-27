@@ -524,7 +524,7 @@ namespace WardogsProfitHudApp
             catch { }
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
             this.MaximizeBox = false;
-            this.ClientSize = new Size(320, 224);
+            this.ClientSize = new Size(320, 236);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.BackColor = Color.FromArgb(12, 12, 14);
             this.ForeColor = Color.FromArgb(168, 174, 184);
@@ -693,6 +693,17 @@ namespace WardogsProfitHudApp
 
             this.Controls.Add(pnlPreview);
             this.Controls.Add(grpControls);
+
+            Label lblCredit = new Label()
+            {
+                Text = "by HIST",
+                Font = new Font("맑은 고딕", 8.5f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(255, 238, 140),
+                Location = new Point(14, 214),
+                Size = new Size(292, 18),
+                TextAlign = ContentAlignment.MiddleRight
+            };
+            this.Controls.Add(lblCredit);
             this.TopMost = chkControlTopMost.Checked;
         }
 
