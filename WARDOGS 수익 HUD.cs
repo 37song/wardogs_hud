@@ -156,23 +156,17 @@ namespace WardogsProfitHudApp
                         continue;
                     }
 
-                    int targetPid = steamPid != 0 ? steamPid : 0;
-                    if (targetPid == 0)
-                    {
-                        Process tr = FindTargetRenderer();
-                        if (tr != null) targetPid = tr.Id;
-                    }
-
-                    if (targetPid == 0)
+                    Process targetRenderer = FindTargetRenderer();
+                    if (targetRenderer == null)
                     {
                         Thread.Sleep(500);
                         continue;
                     }
 
-                    if (targetPid != currentPid || hProc == IntPtr.Zero)
+                    if (targetRenderer.Id != currentPid || hProc == IntPtr.Zero)
                     {
                         if (hProc != IntPtr.Zero) CloseHandle(hProc);
-                        currentPid = targetPid;
+                        currentPid = targetRenderer.Id;
                         hProc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, currentPid);
                         cachedAddr = 0;
                     }
@@ -189,7 +183,7 @@ namespace WardogsProfitHudApp
                     // 최신성 보장: 항상 최상단 역방향 고속 스캔 (~100ms)
                     // 역방향 스캔은 가장 높은 메모리 주소(최신 활성 버퍼)부터 아래로 탐색하여
                     // 첫 매칭 시 즉시 탈출하므로, 과거 캐시 주소에 갇히지 않고 100% 최신 수치만 가져옵니다.
-                    bool ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x7FFFFFFF0000L, pageBuf, out foundAddr, out val, out state);
+                    bool ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x30000000000L, pageBuf, out foundAddr, out val, out state);
 
                     if (ok && !string.IsNullOrEmpty(val))
                     {
