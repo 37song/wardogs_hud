@@ -72,6 +72,31 @@ namespace WardogsProfitHudApp
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern int VirtualQueryEx(IntPtr hProcess, IntPtr lpAddress, out MEMORY_BASIC_INFORMATION lpBuffer, int dwLength);
 
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        private struct PROCESSENTRY32
+        {
+            public uint dwSize;
+            public uint cntUsage;
+            public uint th32ProcessID;
+            public IntPtr th32DefaultHeapID;
+            public uint th32ModuleID;
+            public uint cntThreads;
+            public uint th32ParentProcessID;
+            public int pcPriClassBase;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string szExeFile;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        private static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        private static extern bool Process32First(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        private static extern bool Process32Next(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+
         [StructLayout(LayoutKind.Sequential)]
         private struct MEMORY_BASIC_INFORMATION
         {
@@ -131,14 +156,9 @@ namespace WardogsProfitHudApp
             ulong steamId64 = 0UL;
             IntPtr hHelper = IntPtr.Zero;
             int helperPid = 0;
-
-            byte[] userBytes = new byte[8];
-            byte[] appBytes = BitConverter.GetBytes(1867240UL);
-            byte[] pageBuf = new byte[1024 * 1024];
-
             long cachedAddr = 0;
-            ulong maxObservedTs = 0;
-            DateTime lastFullScan = DateTime.MinValue;
+            byte[] fastBuf = new byte[1024];
+            byte[] pageBuf = new byte[1024 * 1024];
 
             while (isRunning)
             {
@@ -146,7 +166,7 @@ namespace WardogsProfitHudApp
                 {
                     CheckProcesses(out steamPid, ref steamId64);
 
-                    if (!IsSteamRunning || steamId64 == 0UL)
+                    if (!IsSteamRunning)
                     {
                         if (hHelper != IntPtr.Zero) { CloseHandle(hHelper); hHelper = IntPtr.Zero; helperPid = 0; }
                         cachedAddr = 0;
@@ -155,20 +175,17 @@ namespace WardogsProfitHudApp
                         continue;
                     }
 
-                    Buffer.BlockCopy(BitConverter.GetBytes(steamId64), 0, userBytes, 0, 8);
-
-                    // 최적의 steamwebhelper 렌더러 연결
-                    Process bestHelper = FindTargetRenderer();
-                    if (bestHelper == null)
+                    Process targetHelper = FindTargetHelper(steamPid);
+                    if (targetHelper == null)
                     {
                         Thread.Sleep(500);
                         continue;
                     }
 
-                    if (bestHelper.Id != helperPid || hHelper == IntPtr.Zero)
+                    if (targetHelper.Id != helperPid || hHelper == IntPtr.Zero)
                     {
                         if (hHelper != IntPtr.Zero) CloseHandle(hHelper);
-                        helperPid = bestHelper.Id;
+                        helperPid = targetHelper.Id;
                         hHelper = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, helperPid);
                         cachedAddr = 0;
                     }
@@ -179,48 +196,92 @@ namespace WardogsProfitHudApp
                         continue;
                     }
 
-                    ulong localMaxTs = maxObservedTs;
-                    string bestVal = "";
-                    string bestState = "";
-                    string bestGame = "";
-                    string bestFaction = "";
-                    long bestFoundAddr = 0;
+                    bool readSuccess = false;
 
-                    // 1. 캐시된 주소 주변 16MB 고속 스캔 (약 5~8ms 소요)
+                    // 1. 빠른 경로: 이전에 찾은 주소 캐시에서 즉시 읽기 (< 1ms)
                     if (cachedAddr != 0)
                     {
-                        long start = Math.Max(0, cachedAddr - (8 * 1024 * 1024));
-                        long end = cachedAddr + (8 * 1024 * 1024);
-                        ScanRange(hHelper, start, end, userBytes, appBytes, pageBuf,
-                            ref localMaxTs, ref bestVal, ref bestState, ref bestGame, ref bestFaction, ref bestFoundAddr);
-                    }
-
-                    // 2. 캐시가 없거나 2초 이상 새 패킷이 없는 경우 전체 메모리 풀 스윕
-                    if (bestFoundAddr == 0 || (DateTime.UtcNow - lastFullScan).TotalSeconds > 2.0)
-                    {
-                        ScanRange(hHelper, 0, 0x7FFFFFFF0000L, userBytes, appBytes, pageBuf,
-                            ref localMaxTs, ref bestVal, ref bestState, ref bestGame, ref bestFaction, ref bestFoundAddr);
-                        lastFullScan = DateTime.UtcNow;
-                    }
-
-                    if (bestFoundAddr != 0 && !string.IsNullOrEmpty(bestVal))
-                    {
-                        cachedAddr = bestFoundAddr;
-                        maxObservedTs = localMaxTs;
-                        lock (syncLock)
+                        IntPtr nRead;
+                        long readStart = Math.Max(0, cachedAddr - 120);
+                        if (ReadProcessMemory(hHelper, (IntPtr)readStart, fastBuf, 600, out nRead) && (int)nRead > 150)
                         {
-                            curVal = bestVal;
-                            curState = bestState;
-                            curGame = bestGame;
-                            curFaction = bestFaction;
-                            curTs = localMaxTs;
-                            hasData = true;
+                            string text = Encoding.ASCII.GetString(fastBuf, 0, (int)nRead);
+                            if (text.Contains("profit_loss") && (text.Contains("WARDOGS") || text.Contains("#Status_") || text.Contains("in_profit_or_loss")))
+                            {
+                                string val, state, game, faction;
+                                if (TryParseChunk(text, out val, out state, out game, out faction))
+                                {
+                                    lock (syncLock)
+                                    {
+                                        curVal = val;
+                                        curState = state;
+                                        curGame = game;
+                                        curFaction = faction;
+                                        hasData = true;
+                                    }
+                                    readSuccess = true;
+                                }
+                            }
+                        }
+                    }
+
+                    // 2. 캐시 실패 시: 대상 프로세스 메모리 검색
+                    if (!readSuccess)
+                    {
+                        long foundAddr;
+                        string val, state, game, faction;
+                        if (ScanProcessForProfitLoss(hHelper, pageBuf, out foundAddr, out val, out state, out game, out faction))
+                        {
+                            cachedAddr = foundAddr;
+                            lock (syncLock)
+                            {
+                                curVal = val;
+                                curState = state;
+                                curGame = game;
+                                curFaction = faction;
+                                hasData = true;
+                            }
+                            readSuccess = true;
+                        }
+                    }
+
+                    // 만약 주 helper에서 못 찾았다면 모든 steamwebhelper 중에서 검색
+                    if (!readSuccess)
+                    {
+                        Process[] allHelpers = Process.GetProcessesByName("steamwebhelper");
+                        foreach (Process p in allHelpers)
+                        {
+                            if (p.Id == helperPid) continue;
+                            IntPtr hAlt = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, p.Id);
+                            if (hAlt != IntPtr.Zero)
+                            {
+                                long foundAddr;
+                                string val, state, game, faction;
+                                if (ScanProcessForProfitLoss(hAlt, pageBuf, out foundAddr, out val, out state, out game, out faction))
+                                {
+                                    CloseHandle(hHelper);
+                                    hHelper = hAlt;
+                                    helperPid = p.Id;
+                                    cachedAddr = foundAddr;
+                                    lock (syncLock)
+                                    {
+                                        curVal = val;
+                                        curState = state;
+                                        curGame = game;
+                                        curFaction = faction;
+                                        hasData = true;
+                                    }
+                                    readSuccess = true;
+                                    break;
+                                }
+                                CloseHandle(hAlt);
+                            }
                         }
                     }
                 }
                 catch { }
 
-                Thread.Sleep(150);
+                Thread.Sleep(100);
             }
 
             if (hHelper != IntPtr.Zero) CloseHandle(hHelper);
@@ -261,26 +322,58 @@ namespace WardogsProfitHudApp
             IsWardogsRunning = wardogsFound;
         }
 
-        private Process FindTargetRenderer()
+        private Process FindTargetHelper(int steamPid)
         {
+            if (steamPid != 0)
+            {
+                try
+                {
+                    IntPtr hSnap = CreateToolhelp32Snapshot(0x00000002, 0); // TH32CS_SNAPPROCESS
+                    if (hSnap != IntPtr.Zero && hSnap != new IntPtr(-1))
+                    {
+                        PROCESSENTRY32 pe = new PROCESSENTRY32();
+                        pe.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
+                        if (Process32First(hSnap, ref pe))
+                        {
+                            do
+                            {
+                                if (string.Equals(pe.szExeFile, "steamwebhelper.exe", StringComparison.OrdinalIgnoreCase) &&
+                                    pe.th32ParentProcessID == (uint)steamPid)
+                                {
+                                    CloseHandle(hSnap);
+                                    return Process.GetProcessById((int)pe.th32ProcessID);
+                                }
+                            } while (Process32Next(hSnap, ref pe));
+                        }
+                        CloseHandle(hSnap);
+                    }
+                }
+                catch { }
+            }
+
             Process[] procs = Process.GetProcessesByName("steamwebhelper");
             if (procs == null || procs.Length == 0) return null;
-            Array.Sort(procs, (a, b) => b.WorkingSet64.CompareTo(a.WorkingSet64));
             return procs[0];
         }
 
-        private void ScanRange(IntPtr hProc, long startAddr, long endAddr, byte[] userBytes, byte[] appBytes, byte[] pageBuf,
-            ref ulong maxTs, ref string bestVal, ref string bestState, ref string bestGame, ref string bestFaction, ref long bestAddr)
+        private bool ScanProcessForProfitLoss(IntPtr hProc, byte[] pageBuf, out long foundAddr, out string val, out string state, out string game, out string faction)
         {
-            long addr = startAddr;
-            byte[] needleTs = new byte[] { 0xe8, 0x02 };
+            foundAddr = 0;
+            val = "";
+            state = "";
+            game = "";
+            faction = "";
 
-            while (addr < endAddr && isRunning)
+            long addr = 0;
+            byte[] needle = Encoding.ASCII.GetBytes("profit_loss");
+
+            while (addr < 0x7FFFFFFF0000L && isRunning)
             {
                 MEMORY_BASIC_INFORMATION mbi;
                 if (VirtualQueryEx(hProc, (IntPtr)addr, out mbi, Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION))) == 0) break;
                 long baseAddr = (long)mbi.BaseAddress;
                 long size = (long)mbi.RegionSize;
+                if (size <= 0) break;
                 if (baseAddr == 0) baseAddr = addr;
 
                 if (mbi.State == 0x1000 && (mbi.Protect & 0x04) != 0 && (mbi.Protect & 0x100) == 0)
@@ -294,83 +387,59 @@ namespace WardogsProfitHudApp
                         {
                             int bytesRead = (int)nRead;
                             int idx = 0;
-                            while (idx <= bytesRead - 8)
+                            while (idx <= bytesRead - needle.Length)
                             {
-                                if (MatchAt(pageBuf, idx, userBytes, 8))
+                                int matchIdx = FindBytesSub(pageBuf, idx, bytesRead - idx, needle, 0, needle.Length);
+                                if (matchIdx == -1) break;
+
+                                int start = Math.Max(0, matchIdx - 100);
+                                int chunkLen = Math.Min(bytesRead - start, 500);
+                                string chunk = Encoding.ASCII.GetString(pageBuf, start, chunkLen);
+
+                                if (chunk.Contains("WARDOGS") || chunk.Contains("PersonaUpdate") || chunk.Contains("#Status_") || chunk.Contains("in_profit_or_loss"))
                                 {
-                                    int chunkLen = Math.Min(bytesRead - idx, 600);
-                                    if (chunkLen > 100)
+                                    if (TryParseChunk(chunk, out val, out state, out game, out faction))
                                     {
-                                        int appIdx = FindBytesSub(pageBuf, idx, chunkLen, appBytes, 0, 8);
-                                        if (appIdx != -1)
-                                        {
-                                            int pLossIdx = FindAscii(pageBuf, idx, chunkLen, "profit_loss");
-                                            if (pLossIdx != -1)
-                                            {
-                                                int tsIdx = FindBytesSub(pageBuf, idx, chunkLen, needleTs, 0, 2);
-                                                ulong ts = 0;
-                                                if (tsIdx != -1)
-                                                {
-                                                    ts = DecodeVarint(pageBuf, tsIdx + 2, idx + chunkLen);
-                                                }
-
-                                                if (ts >= maxTs)
-                                                {
-                                                    string chunk = Encoding.ASCII.GetString(pageBuf, idx, chunkLen);
-                                                    Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
-                                                    if (m.Success)
-                                                    {
-                                                        maxTs = ts;
-                                                        bestVal = m.Groups[1].Value.Trim();
-                                                        bestAddr = baseAddr + curOffset + idx;
-
-                                                        Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                                        if (ms.Success) bestState = ms.Groups[1].Value.ToLowerInvariant();
-
-                                                        Match mg = Regex.Match(chunk, @"game_state[^\w]*(\w+)", RegexOptions.IgnoreCase);
-                                                        if (mg.Success) bestGame = mg.Groups[1].Value.ToLowerInvariant();
-
-                                                        Match mf = Regex.Match(chunk, @"faction[^\w]*(charlie|bravo|alpha)", RegexOptions.IgnoreCase);
-                                                        if (mf.Success) bestFaction = mf.Groups[1].Value.ToLowerInvariant();
-                                                    }
-                                                }
-                                            }
-                                        }
+                                        foundAddr = baseAddr + curOffset + matchIdx;
+                                        return true;
                                     }
-                                    idx += 8;
                                 }
-                                else
-                                {
-                                    idx++;
-                                }
+                                idx = matchIdx + needle.Length;
                             }
                         }
                         curOffset += toRead;
                     }
                 }
-                addr = baseAddr + size;
+                long nextAddr = baseAddr + size;
+                if (nextAddr <= addr) break;
+                addr = nextAddr;
             }
+
+            return false;
         }
 
-        private static ulong DecodeVarint(byte[] buf, int offset, int maxOffset)
+        private static bool TryParseChunk(string chunk, out string val, out string state, out string game, out string faction)
         {
-            ulong val = 0;
-            int shift = 0;
-            for (int i = 0; i < 10; i++)
-            {
-                if (offset + i >= maxOffset) break;
-                byte b = buf[offset + i];
-                val |= ((ulong)(b & 0x7F)) << shift;
-                shift += 7;
-                if ((b & 0x80) == 0) return val;
-            }
-            return 0;
-        }
+            val = "";
+            state = "";
+            game = "";
+            faction = "";
 
-        private static int FindAscii(byte[] buf, int start, int count, string text)
-        {
-            byte[] needle = Encoding.ASCII.GetBytes(text);
-            return FindBytesSub(buf, start, count, needle, 0, needle.Length);
+            Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
+            if (!m.Success) return false;
+
+            val = m.Groups[1].Value.Trim();
+
+            Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+            if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
+
+            Match mg = Regex.Match(chunk, @"game_state[^\w]*(\w+)", RegexOptions.IgnoreCase);
+            if (mg.Success) game = mg.Groups[1].Value.ToLowerInvariant();
+
+            Match mf = Regex.Match(chunk, @"faction[^\w]*(charlie|bravo|alpha)", RegexOptions.IgnoreCase);
+            if (mf.Success) faction = mf.Groups[1].Value.ToLowerInvariant();
+
+            return true;
         }
 
         private static int FindBytesSub(byte[] src, int startIdx, int count, byte[] needle, int needleStart, int needleLen)
@@ -386,15 +455,6 @@ namespace WardogsProfitHudApp
                 if (ok) return i;
             }
             return -1;
-        }
-
-        private static bool MatchAt(byte[] src, int offset, byte[] needle, int len)
-        {
-            for (int i = 0; i < len; i++)
-            {
-                if (src[offset + i] != needle[i]) return false;
-            }
-            return true;
         }
 
         public void Dispose()
