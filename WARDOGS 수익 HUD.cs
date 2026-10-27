@@ -183,7 +183,7 @@ namespace WardogsProfitHudApp
                     // 최신성 보장: 항상 최상단 역방향 고속 스캔 (~100ms)
                     // 역방향 스캔은 가장 높은 메모리 주소(최신 활성 버퍼)부터 아래로 탐색하여
                     // 첫 매칭 시 즉시 탈출하므로, 과거 캐시 주소에 갇히지 않고 100% 최신 수치만 가져옵니다.
-                    bool ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x30000000000L, pageBuf, steamId64, out foundAddr, out val, out state);
+                    bool ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x30000000000L, pageBuf, out foundAddr, out val, out state);
 
                     if (ok && !string.IsNullOrEmpty(val))
                     {
@@ -259,7 +259,7 @@ namespace WardogsProfitHudApp
             IsWardogsRunning = wardogsFound;
         }
 
-        private bool ScanNativeStreamRange(IntPtr hProc, long startAddr, long endAddr, byte[] pageBuf, ulong targetSteamId, out long foundAddr, out string val, out string state)
+        private bool ScanNativeStreamRange(IntPtr hProc, long startAddr, long endAddr, byte[] pageBuf, out long foundAddr, out string val, out string state)
         {
             foundAddr = 0; val = ""; state = "";
             long addr = startAddr;
@@ -297,34 +297,16 @@ namespace WardogsProfitHudApp
                     if (ReadProcessMemory(hProc, (IntPtr)chunkStart, pageBuf, chunkToRead, out nRead))
                     {
                         int bytesRead = (int)nRead;
-                        byte[] sidBytes = targetSteamId != 0 ? BitConverter.GetBytes(targetSteamId) : null;
                         int idx = FindBytesSubReverse(pageBuf, 0, bytesRead, needle);
                         while (idx != -1 && isRunning)
                         {
-                            // 타인/로비 패킷 오인 방지: 내 SteamID64 바이너리가 주변 200바이트 내에 존재하는지 철저히 검증
-                            bool isMine = true;
-                            if (sidBytes != null)
-                            {
-                                isMine = false;
-                                int checkStart = Math.Max(0, idx - 200);
-                                int checkEnd = Math.Min(bytesRead - 8, idx + 200);
-                                for (int k = checkStart; k <= checkEnd; k++)
-                                {
-                                    bool sidMatch = true;
-                                    for (int b = 0; b < 8; b++)
-                                    {
-                                        if (pageBuf[k + b] != sidBytes[b]) { sidMatch = false; break; }
-                                    }
-                                    if (sidMatch) { isMine = true; break; }
-                                }
-                            }
+                            int start = Math.Max(0, idx - 60);
+                            int chunkLen = Math.Min(bytesRead - start, 300);
+                            string chunk = Encoding.ASCII.GetString(pageBuf, start, chunkLen);
 
-                            if (isMine)
+                            // 스팀 챗/친구창의 최신 실시간 WARDOGS Rich Presence 검증
+                            if (chunk.Contains("steam_display") || chunk.Contains("in_profit_or_loss") || chunk.Contains("gamedata"))
                             {
-                                int start = Math.Max(0, idx - 60);
-                                int chunkLen = Math.Min(bytesRead - start, 300);
-                                string chunk = Encoding.ASCII.GetString(pageBuf, start, chunkLen);
-
                                 Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
                                 if (m.Success)
                                 {
