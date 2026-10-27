@@ -139,7 +139,7 @@ namespace WardogsProfitHudApp
             int currentPid = 0;
             long cachedAddr = 0;
 
-            byte[] pageBuf = new byte[2 * 1024 * 1024];
+            byte[] pageBuf = new byte[1024 * 1024];
 
             while (isRunning)
             {
@@ -156,7 +156,6 @@ namespace WardogsProfitHudApp
                         continue;
                     }
 
-                    // 스팀챗/친구창을 렌더링하는 steamwebhelper 렌더러 프로세스 타겟팅
                     Process targetRenderer = FindTargetRenderer();
                     if (targetRenderer == null)
                     {
@@ -178,23 +177,23 @@ namespace WardogsProfitHudApp
                         continue;
                     }
 
-                    string val = "", state = "", game = "", faction = "";
+                    string val = "", state = "";
                     long foundAddr = 0;
                     bool ok = false;
 
-                    // 1. 빠른 경로: 캐시된 주소 주변 24MB 고속 역방향 스캔 (~50ms)
+                    // 1. 빠른 경로: 캐시 주소 앞뒤 1MB 검사 (< 2ms)
                     if (cachedAddr != 0)
                     {
-                        long start = Math.Max(0, cachedAddr - (8 * 1024 * 1024));
-                        long end = cachedAddr + (16 * 1024 * 1024);
-                        ok = ReverseScanRange(hProc, start, end, pageBuf, out foundAddr, out val, out state, out game, out faction);
+                        long start = Math.Max(0x10000000000L, cachedAddr - (512 * 1024));
+                        long end = cachedAddr + (1024 * 1024);
+                        ok = ScanNativeStreamRange(hProc, start, end, pageBuf, out foundAddr, out val, out state);
                         if (ok) cachedAddr = foundAddr;
                     }
 
-                    // 2. 캐시가 없거나 범위를 벗어난 경우: 전체 메모리 역방향 스캔
+                    // 2. 전체 네이티브 수신 스트림 역방향 고속 스캔 (~150ms)
                     if (!ok)
                     {
-                        ok = ReverseScanRange(hProc, 0, 0x7FFFFFFF0000L, pageBuf, out foundAddr, out val, out state, out game, out faction);
+                        ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x30000000000L, pageBuf, out foundAddr, out val, out state);
                         if (ok) cachedAddr = foundAddr;
                     }
 
@@ -204,15 +203,13 @@ namespace WardogsProfitHudApp
                         {
                             curVal = val;
                             curState = state;
-                            curGame = game;
-                            curFaction = faction;
                             hasData = true;
                         }
                     }
                 }
                 catch { }
 
-                Thread.Sleep(100);
+                Thread.Sleep(50);
             }
 
             if (hProc != IntPtr.Zero) CloseHandle(hProc);
@@ -274,14 +271,9 @@ namespace WardogsProfitHudApp
             IsWardogsRunning = wardogsFound;
         }
 
-        private bool ReverseScanRange(IntPtr hProc, long startAddr, long endAddr, byte[] pageBuf, out long foundAddr, out string val, out string state, out string game, out string faction)
+        private bool ScanNativeStreamRange(IntPtr hProc, long startAddr, long endAddr, byte[] pageBuf, out long foundAddr, out string val, out string state)
         {
-            foundAddr = 0;
-            val = "";
-            state = "";
-            game = "";
-            faction = "";
-
+            foundAddr = 0; val = ""; state = "";
             long addr = startAddr;
             List<MemRegion> regions = new List<MemRegion>();
 
@@ -294,7 +286,7 @@ namespace WardogsProfitHudApp
                 if (size <= 0) break;
                 if (baseAddr == 0) baseAddr = addr;
 
-                if (mbi.State == 0x1000 && (mbi.Protect & 0x04) != 0 && (mbi.Protect & 0x100) == 0 && size < 50 * 1024 * 1024)
+                if (mbi.State == 0x1000 && (mbi.Protect & 0x04) != 0 && (mbi.Protect & 0x100) == 0 && size < 20 * 1024 * 1024)
                 {
                     regions.Add(new MemRegion { Base = baseAddr, Size = size });
                 }
@@ -305,7 +297,6 @@ namespace WardogsProfitHudApp
 
             byte[] needle = Encoding.ASCII.GetBytes("profit_loss");
 
-            // 최신 할당 메모리부터 역방향 탐색 (높은 주소 -> 낮은 주소)
             for (int r = regions.Count - 1; r >= 0 && isRunning; r--)
             {
                 MemRegion reg = regions[r];
@@ -325,8 +316,15 @@ namespace WardogsProfitHudApp
                             int chunkLen = Math.Min(bytesRead - start, 300);
                             string chunk = Encoding.ASCII.GetString(pageBuf, start, chunkLen);
 
-                            if (TryParseChunk(chunk, out val, out state, out game, out faction))
+                            Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
+                            if (m.Success)
                             {
+                                val = m.Groups[1].Value.Trim();
+                                Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+                                if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
+                                else if (val.Contains("-")) state = "loss";
+                                else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
+
                                 foundAddr = chunkStart + idx;
                                 return true;
                             }
@@ -353,32 +351,6 @@ namespace WardogsProfitHudApp
                 if (ok) return i;
             }
             return -1;
-        }
-
-        private static bool TryParseChunk(string chunk, out string val, out string state, out string game, out string faction)
-        {
-            val = "";
-            state = "";
-            game = "";
-            faction = "";
-
-            Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
-            if (!m.Success) return false;
-
-            val = m.Groups[1].Value.Trim();
-
-            Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-            if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
-            else if (val.Contains("-")) state = "loss";
-            else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
-
-            Match mg = Regex.Match(chunk, @"game_state[^\w]*(\w+)", RegexOptions.IgnoreCase);
-            if (mg.Success) game = mg.Groups[1].Value.ToLowerInvariant();
-
-            Match mf = Regex.Match(chunk, @"faction[^\w]*(charlie|bravo|alpha)", RegexOptions.IgnoreCase);
-            if (mf.Success) faction = mf.Groups[1].Value.ToLowerInvariant();
-
-            return true;
         }
 
         public void Dispose()
