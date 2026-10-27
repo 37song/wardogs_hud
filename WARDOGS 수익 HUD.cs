@@ -195,6 +195,7 @@ namespace WardogsProfitHudApp
 
                     string val = "", state = "";
                     long foundAddr = 0;
+                    bool inGame = false;
 
                     // 1. 활성 스트림 블록 국소 초고속 검사 (0.01ms)
                     bool ok = false;
@@ -205,47 +206,68 @@ namespace WardogsProfitHudApp
                         if (ReadProcessMemory(hProc, (IntPtr)readStart, pageBuf, 4096, out nRead))
                         {
                             int bytesRead = (int)nRead;
-                            byte[] needle = Encoding.ASCII.GetBytes("profit_loss");
+                            byte[] needle = Encoding.ASCII.GetBytes("steam_display");
                             int idx = FindBytesSubReverse(pageBuf, 0, bytesRead, needle);
                             if (idx != -1)
                             {
-                                int start = Math.Max(0, idx - 120);
+                                int start = Math.Max(0, idx - 80);
                                 int chunkLen = Math.Min(bytesRead - start, 300);
                                 string chunk = Encoding.ASCII.GetString(pageBuf, start, chunkLen);
-                                if (chunk.Contains("Status_KOTH") || chunk.Contains("steam_display") || chunk.Contains("in_profit_or_loss"))
+                                if (chunk.Contains("#Status_") || chunk.Contains("gamedata"))
                                 {
-                                    Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
-                                    if (m.Success)
-                                    {
-                                        val = m.Groups[1].Value.Replace(" ", "");
-                                        Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                        if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
-                                        else if (val.Contains("-")) state = "loss";
-                                        else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
+                                    foundAddr = readStart + idx;
+                                    cachedAddr = foundAddr;
 
-                                        foundAddr = readStart + idx;
-                                        cachedAddr = foundAddr;
+                                    if (chunk.Contains("#Status_Frontend") || chunk.Contains("Frontend") || !chunk.Contains("profit_loss"))
+                                    {
+                                        state = "frontend";
+                                        inGame = false;
+                                        val = "";
                                         ok = true;
+                                    }
+                                    else
+                                    {
+                                        Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
+                                        if (m.Success)
+                                        {
+                                            val = m.Groups[1].Value.Replace(" ", "");
+                                            Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+                                            if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
+                                            else if (val.Contains("-")) state = "loss";
+                                            else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
+
+                                            inGame = true;
+                                            ok = true;
+                                        }
                                     }
                                 }
                             }
                         }
                     }
 
-                    // 2. 새 스트림 페이지 할당 시 역방향 최상단 고속 스캔 (~40ms)
+                    // 2. 새 스트림 페이지 할당 시 역방향 최상단 고속 스캔 (~24ms)
                     if (!ok)
                     {
-                        ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x40000000000L, pageBuf, out foundAddr, out val, out state);
+                        ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x40000000000L, pageBuf, out foundAddr, out val, out state, out inGame);
                         if (ok && foundAddr > 0) cachedAddr = foundAddr;
                     }
 
-                    if (ok && !string.IsNullOrEmpty(val))
+                    if (ok)
                     {
                         lock (syncLock)
                         {
-                            curVal = val;
-                            curState = state;
-                            hasData = true;
+                            if (inGame && !string.IsNullOrEmpty(val))
+                            {
+                                curVal = val;
+                                curState = state;
+                                hasData = true;
+                            }
+                            else
+                            {
+                                curVal = "";
+                                curState = state;
+                                hasData = false;
+                            }
                         }
                     }
                 }
@@ -313,9 +335,9 @@ namespace WardogsProfitHudApp
             IsWardogsRunning = wardogsFound;
         }
 
-        private bool ScanNativeStreamRange(IntPtr hProc, long startAddr, long endAddr, byte[] pageBuf, out long foundAddr, out string val, out string state)
+        private bool ScanNativeStreamRange(IntPtr hProc, long startAddr, long endAddr, byte[] pageBuf, out long foundAddr, out string val, out string state, out bool inGame)
         {
-            foundAddr = 0; val = ""; state = "";
+            foundAddr = 0; val = ""; state = ""; inGame = false;
             long addr = startAddr;
             List<MemRegion> regions = new List<MemRegion>();
 
@@ -328,7 +350,7 @@ namespace WardogsProfitHudApp
                 if (size <= 0) break;
                 if (baseAddr == 0) baseAddr = addr;
 
-                if (mbi.State == 0x1000 && (mbi.Protect & 0x04) != 0 && (mbi.Protect & 0x100) == 0 && size < 20 * 1024 * 1024)
+                if (mbi.State == 0x1000 && (mbi.Protect & 0x04) != 0 && (mbi.Protect & 0x100) == 0 && size >= 4096 && size <= 20 * 1024 * 1024)
                 {
                     regions.Add(new MemRegion { Base = baseAddr, Size = size });
                 }
@@ -337,7 +359,7 @@ namespace WardogsProfitHudApp
                 addr = nextAddr;
             }
 
-            byte[] needle = Encoding.ASCII.GetBytes("profit_loss");
+            byte[] needle = Encoding.ASCII.GetBytes("steam_display");
 
             for (int r = regions.Count - 1; r >= 0 && isRunning; r--)
             {
@@ -354,23 +376,34 @@ namespace WardogsProfitHudApp
                         int idx = FindBytesSubReverse(pageBuf, 0, bytesRead, needle);
                         while (idx != -1 && isRunning)
                         {
-                            int start = Math.Max(0, idx - 120);
+                            int start = Math.Max(0, idx - 80);
                             int chunkLen = Math.Min(bytesRead - start, 300);
                             string chunk = Encoding.ASCII.GetString(pageBuf, start, chunkLen);
 
-                            // 스팀 챗/친구창의 최신 실시간 WARDOGS Rich Presence 검증
-                            if (chunk.Contains("Status_KOTH") || chunk.Contains("steam_display") || chunk.Contains("in_profit_or_loss"))
+                            if (chunk.Contains("#Status_") || chunk.Contains("gamedata"))
                             {
+                                foundAddr = chunkStart + idx;
+
+                                // 로비/메인메뉴 상태 (#Status_Frontend 또는 방에 입장하지 않아 profit_loss가 없는 대기 상태)
+                                if (chunk.Contains("#Status_Frontend") || chunk.Contains("Frontend") || !chunk.Contains("profit_loss"))
+                                {
+                                    state = "frontend";
+                                    inGame = false;
+                                    val = "";
+                                    return true;
+                                }
+
+                                // 경기 중 실시간 profit_loss 패킷
                                 Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
                                 if (m.Success)
                                 {
-                                    val = m.Groups[1].Value.Trim();
+                                    val = m.Groups[1].Value.Replace(" ", "");
                                     Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
                                     if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
                                     else if (val.Contains("-")) state = "loss";
                                     else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
 
-                                    foundAddr = chunkStart + idx;
+                                    inGame = true;
                                     return true;
                                 }
                             }
