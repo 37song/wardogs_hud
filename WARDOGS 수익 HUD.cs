@@ -179,23 +179,11 @@ namespace WardogsProfitHudApp
 
                     string val = "", state = "";
                     long foundAddr = 0;
-                    bool ok = false;
 
-                    // 1. 빠른 경로: 캐시 주소 앞뒤 1MB 검사 (< 2ms)
-                    if (cachedAddr != 0)
-                    {
-                        long start = Math.Max(0x10000000000L, cachedAddr - (512 * 1024));
-                        long end = cachedAddr + (1024 * 1024);
-                        ok = ScanNativeStreamRange(hProc, start, end, pageBuf, out foundAddr, out val, out state);
-                        if (ok) cachedAddr = foundAddr;
-                    }
-
-                    // 2. 전체 네이티브 수신 스트림 역방향 고속 스캔 (~150ms)
-                    if (!ok)
-                    {
-                        ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x30000000000L, pageBuf, out foundAddr, out val, out state);
-                        if (ok) cachedAddr = foundAddr;
-                    }
+                    // 최신성 보장: 항상 최상단 역방향 고속 스캔 (~100ms)
+                    // 역방향 스캔은 가장 높은 메모리 주소(최신 활성 버퍼)부터 아래로 탐색하여
+                    // 첫 매칭 시 즉시 탈출하므로, 과거 캐시 주소에 갇히지 않고 100% 최신 수치만 가져옵니다.
+                    bool ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x30000000000L, pageBuf, out foundAddr, out val, out state);
 
                     if (ok && !string.IsNullOrEmpty(val))
                     {
