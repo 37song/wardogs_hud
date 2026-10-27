@@ -1041,11 +1041,11 @@ namespace WardogsProfitHudApp
                 SizeF mainSz = g.MeasureString(prefix + mainText, mainFont);
                 SizeF subSz = string.IsNullOrEmpty(deltaText) ? SizeF.Empty : g.MeasureString(deltaText, subFont);
 
-                int w = (int)Math.Ceiling(mainSz.Width + subSz.Width + (string.IsNullOrEmpty(deltaText) ? 28 : 38));
-                int h = (int)Math.Ceiling(Math.Max(mainSz.Height, subSz.Height) + 16);
+                int w = (int)Math.Ceiling(mainSz.Width + (string.IsNullOrEmpty(deltaText) ? 24 : (subSz.Width + 30)));
+                int h = (int)Math.Ceiling(Math.Max(mainSz.Height, subSz.Height) + 10);
 
-                w = Math.Max(140, w);
-                h = Math.Max(32, h);
+                w = Math.Max(48, w);
+                h = Math.Max(28, h);
 
                 if (this.Width != w || this.Height != h)
                 {
