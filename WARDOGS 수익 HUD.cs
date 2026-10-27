@@ -85,12 +85,6 @@ namespace WardogsProfitHudApp
             public uint Type;
         }
 
-        private struct MemRegion
-        {
-            public long Base;
-            public long Size;
-        }
-
         private const uint PROCESS_VM_READ = 0x0010;
         private const uint PROCESS_QUERY_INFORMATION = 0x0400;
 
@@ -129,147 +123,6 @@ namespace WardogsProfitHudApp
                 timestamp = curTs;
                 return hasData;
             }
-        }
-
-        private void WorkerLoop()
-        {
-            int steamPid = 0;
-            ulong steamId64 = 0UL;
-            IntPtr hProc = IntPtr.Zero;
-            int currentPid = 0;
-            long cachedAddr = 0;
-            int refreshTick = 0;
-
-            byte[] pageBuf = new byte[65536];
-
-            while (isRunning)
-            {
-                try
-                {
-                    uint activeUser;
-                    CheckProcesses(out steamPid, out activeUser, ref steamId64);
-                    if (++refreshTick % 4 == 0) cachedAddr = 0; // 1초마다 최신 주소 자동 재스캔 (과거 $0 고착 원천 방지)
-
-                    if (!IsSteamRunning)
-                    {
-                        if (hProc != IntPtr.Zero) { CloseHandle(hProc); hProc = IntPtr.Zero; currentPid = 0; }
-                        cachedAddr = 0;
-                        lock (syncLock) { hasData = false; curVal = ""; curState = "frontend"; }
-                        Thread.Sleep(1000);
-                        continue;
-                    }
-
-                    int targetPid = 0;
-                    if (steamPid != 0)
-                    {
-                        try
-                        {
-                            Process sp = Process.GetProcessById(steamPid);
-                            if (!sp.HasExited) targetPid = steamPid;
-                        }
-                        catch { }
-                    }
-                    if (targetPid == 0)
-                    {
-                        Process[] sps = Process.GetProcessesByName("steam");
-                        if (sps != null && sps.Length > 0) targetPid = sps[0].Id;
-                    }
-
-                    if (targetPid == 0)
-                    {
-                        Thread.Sleep(500);
-                        continue;
-                    }
-
-                    if (targetPid != currentPid || hProc == IntPtr.Zero)
-                    {
-                        if (hProc != IntPtr.Zero) CloseHandle(hProc);
-                        currentPid = targetPid;
-                        hProc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, currentPid);
-                        cachedAddr = 0;
-                    }
-
-                    if (hProc == IntPtr.Zero)
-                    {
-                        Thread.Sleep(500);
-                        continue;
-                    }
-
-                    string val = "", state = "";
-                    long foundAddr = 0;
-                    bool inGame = false;
-                    bool ok = false;
-
-                    // 1. 캐시된 로컬 유저 Rich Presence 주소 국소 초고속 직접 읽기 (0.01ms)
-                    if (cachedAddr > 0)
-                    {
-                        IntPtr nRead;
-                        if (ReadProcessMemory(hProc, (IntPtr)cachedAddr, pageBuf, 256, out nRead) && (int)nRead > 64)
-                        {
-                            string chunk = Encoding.ASCII.GetString(pageBuf, 0, (int)nRead);
-
-                            if (chunk.Contains("#Status_KOTH") && (chunk.Contains("playing") || chunk.Contains("pre_match")))
-                            {
-                                Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
-                                if (m.Success)
-                                {
-                                    val = m.Groups[1].Value.Replace(" ", "");
-                                    Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                    if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
-                                    else if (val.Contains("-")) state = "loss";
-                                    else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
-
-                                    inGame = true;
-                                    ok = true;
-                                }
-                            }
-                            else if (chunk.Contains("#Status_Frontend") || chunk.Contains("Frontend"))
-                            {
-                                state = "frontend";
-                                inGame = false;
-                                val = "";
-                                ok = true;
-                            }
-                        }
-
-                        if (!ok)
-                        {
-                            cachedAddr = 0;
-                        }
-                    }
-
-                    // 2. 캐시가 없는 경우 로컬 유저 전용 Rich Presence 버퍼 스캔
-                    if (!ok)
-                    {
-                        ok = ScanNativeStreamRange(hProc, 0x10000000000L, 0x40000000000L, activeUser, steamId64, pageBuf, out foundAddr, out val, out state, out inGame);
-                        if (ok && foundAddr > 0 && inGame)
-                        {
-                            cachedAddr = foundAddr;
-                        }
-                    }
-
-                    lock (syncLock)
-                    {
-                        if (inGame && !string.IsNullOrEmpty(val))
-                        {
-                            curVal = val;
-                            curState = state;
-                            hasData = true;
-                        }
-                        else
-                        {
-                            curVal = "";
-                            curState = state;
-                            hasData = false;
-                        }
-                    }
-                }
-                catch { }
-
-                Thread.Sleep(250);
-            }
-
-            if (hProc != IntPtr.Zero) CloseHandle(hProc);
         }
 
         private static Process FindTargetRenderer()
@@ -329,7 +182,156 @@ namespace WardogsProfitHudApp
             IsWardogsRunning = wardogsFound;
         }
 
-        private bool ScanNativeStreamRange(IntPtr hProc, long startAddr, long endAddr, uint activeUser, ulong steamId64, byte[] pageBuf, out long foundAddr, out string val, out string state, out bool inGame)
+        private void WorkerLoop()
+        {
+            int steamPid = 0;
+            ulong steamId64 = 0UL;
+            IntPtr hProc = IntPtr.Zero;
+            int currentPid = 0;
+            long cachedAddr = 0;
+
+            byte[] pageBuf = new byte[65536];
+
+            while (isRunning)
+            {
+                try
+                {
+                    uint activeUser;
+                    CheckProcesses(out steamPid, out activeUser, ref steamId64);
+
+                    if (!IsSteamRunning)
+                    {
+                        if (hProc != IntPtr.Zero) { CloseHandle(hProc); hProc = IntPtr.Zero; currentPid = 0; }
+                        cachedAddr = 0;
+                        lock (syncLock) { hasData = false; curVal = ""; curState = "frontend"; }
+                        Thread.Sleep(1000);
+                        continue;
+                    }
+
+                    Process renderer = FindTargetRenderer();
+                    int targetPid = 0;
+                    bool isRenderer = false;
+
+                    if (renderer != null && !renderer.HasExited)
+                    {
+                        targetPid = renderer.Id;
+                        isRenderer = true;
+                    }
+                    else if (steamPid != 0)
+                    {
+                        try
+                        {
+                            Process sp = Process.GetProcessById(steamPid);
+                            if (!sp.HasExited) targetPid = steamPid;
+                        }
+                        catch { }
+                    }
+                    if (targetPid == 0)
+                    {
+                        Process[] sps = Process.GetProcessesByName("steam");
+                        if (sps != null && sps.Length > 0) targetPid = sps[0].Id;
+                    }
+
+                    if (targetPid == 0)
+                    {
+                        Thread.Sleep(500);
+                        continue;
+                    }
+
+                    if (targetPid != currentPid || hProc == IntPtr.Zero)
+                    {
+                        if (hProc != IntPtr.Zero) CloseHandle(hProc);
+                        currentPid = targetPid;
+                        hProc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, currentPid);
+                        cachedAddr = 0;
+                    }
+
+                    if (hProc == IntPtr.Zero)
+                    {
+                        Thread.Sleep(500);
+                        continue;
+                    }
+
+                    string val = "", state = "";
+                    long foundAddr = 0;
+                    bool inGame = false;
+                    bool ok = false;
+
+                    if (cachedAddr > 0)
+                    {
+                        IntPtr nRead;
+                        long readStart = Math.Max(0, cachedAddr - 60);
+                        if (ReadProcessMemory(hProc, (IntPtr)readStart, pageBuf, 256, out nRead) && (int)nRead > 64)
+                        {
+                            string chunk = Encoding.ASCII.GetString(pageBuf, 0, (int)nRead);
+
+                            if ((chunk.Contains("#Status_KOTH") || chunk.Contains("Status_KOTH") || chunk.Contains("playing")) &&
+                                !chunk.Contains("unknown") && !chunk.Contains("match_lost"))
+                            {
+                                Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
+                                if (m.Success)
+                                {
+                                    val = m.Groups[1].Value.Replace(" ", "");
+                                    Match ms = Regex.Match(chunk, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+                                    if (ms.Success) state = ms.Groups[1].Value.ToLowerInvariant();
+                                    else if (val.Contains("-")) state = "loss";
+                                    else if (val.Contains("+") || (!val.Contains("-") && val != "$0")) state = "profit";
+
+                                    inGame = true;
+                                    ok = true;
+                                }
+                            }
+                            else if (chunk.Contains("#Status_Frontend") || chunk.Contains("Frontend"))
+                            {
+                                state = "frontend";
+                                inGame = false;
+                                val = "";
+                                ok = true;
+                            }
+                        }
+
+                        if (!ok)
+                        {
+                            cachedAddr = 0;
+                        }
+                    }
+
+                    if (!ok)
+                    {
+                        long scanStart = 0x10000000000L;
+                        long scanEnd = isRenderer ? 0x25000000000L : 0x40000000000L;
+                        ok = ScanNativeStreamRange(hProc, scanStart, scanEnd, activeUser, steamId64, isRenderer, pageBuf, out foundAddr, out val, out state, out inGame);
+                        if (ok && foundAddr > 0 && inGame)
+                        {
+                            cachedAddr = foundAddr;
+                        }
+                    }
+
+                    lock (syncLock)
+                    {
+                        if (inGame && !string.IsNullOrEmpty(val))
+                        {
+                            curVal = val;
+                            curState = state;
+                            hasData = true;
+                        }
+                        else
+                        {
+                            curVal = "";
+                            curState = state;
+                            hasData = false;
+                        }
+                    }
+                }
+                catch { }
+
+                Thread.Sleep(200);
+            }
+
+            if (hProc != IntPtr.Zero) CloseHandle(hProc);
+        }
+
+        private bool ScanNativeStreamRange(IntPtr hProc, long startAddr, long endAddr, uint activeUser, ulong steamId64, bool isRendererTarget, byte[] pageBuf, out long foundAddr, out string val, out string state, out bool inGame)
         {
             foundAddr = 0; val = ""; state = ""; inGame = false;
 
@@ -338,14 +340,11 @@ namespace WardogsProfitHudApp
             byte[] userBytes4 = activeUser != 0 ? BitConverter.GetBytes(activeUser) : null;
             byte[] userBytes8 = steamId64 != 0 ? BitConverter.GetBytes(steamId64) : null;
             byte[] userStrBytes = steamId64 != 0 ? Encoding.ASCII.GetBytes(steamId64.ToString()) : null;
+            byte[] histBytes = Encoding.ASCII.GetBytes("HIST");
 
             long bestUserAddr = 0;
             string bestUserVal = "", bestUserState = "";
             bool bestUserInGame = false;
-
-            long fallbackAddr = 0;
-            string fallbackVal = "", fallbackState = "";
-            bool fallbackInGame = false;
 
             long addr = startAddr;
 
@@ -381,11 +380,12 @@ namespace WardogsProfitHudApp
                                     }
                                     if (match)
                                     {
-                                        int chunkStart = Math.Max(0, i - 100);
-                                        int chunkLen = Math.Min(bytesRead - chunkStart, 250);
+                                        int chunkStart = Math.Max(0, i - 350);
+                                        int chunkLen = Math.Min(bytesRead - chunkStart, 650);
                                         string chunk = Encoding.ASCII.GetString(pageBuf, chunkStart, chunkLen);
 
-                                        if (chunk.Contains("#Status_KOTH") || chunk.Contains("Status_KOTH"))
+                                        if ((chunk.Contains("#Status_KOTH") || chunk.Contains("Status_KOTH") || (isRendererTarget && chunk.Contains("playing"))) &&
+                                            !chunk.Contains("unknown") && !chunk.Contains("match_lost"))
                                         {
                                             Match m = Regex.Match(chunk, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
                                             if (m.Success)
@@ -397,10 +397,14 @@ namespace WardogsProfitHudApp
                                                 else if (pVal.Contains("-")) pState = "loss";
                                                 else if (pVal.Contains("+") || (!pVal.Contains("-") && pVal != "$0")) pState = "profit";
 
-                                                bool isLocalUser = false;
-                                                if (userBytes4 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes4) != -1) isLocalUser = true;
-                                                else if (userBytes8 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes8) != -1) isLocalUser = true;
-                                                else if (userStrBytes != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userStrBytes) != -1) isLocalUser = true;
+                                                bool isLocalUser = isRendererTarget;
+                                                if (!isLocalUser)
+                                                {
+                                                    if (userBytes4 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes4) != -1) isLocalUser = true;
+                                                    else if (userBytes8 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes8) != -1) isLocalUser = true;
+                                                    else if (userStrBytes != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userStrBytes) != -1) isLocalUser = true;
+                                                    else if (FindBytesSub(pageBuf, chunkStart, chunkLen, histBytes) != -1) isLocalUser = true;
+                                                }
 
                                                 if (isLocalUser)
                                                 {
@@ -408,13 +412,6 @@ namespace WardogsProfitHudApp
                                                     bestUserVal = pVal;
                                                     bestUserState = pState;
                                                     bestUserInGame = true;
-                                                }
-                                                else
-                                                {
-                                                    fallbackAddr = baseAddr + offset + i;
-                                                    fallbackVal = pVal;
-                                                    fallbackState = pState;
-                                                    fallbackInGame = true;
                                                 }
                                             }
                                         }
@@ -446,15 +443,6 @@ namespace WardogsProfitHudApp
                 return true;
             }
 
-            if (fallbackAddr > 0)
-            {
-                foundAddr = fallbackAddr;
-                val = fallbackVal;
-                state = fallbackState;
-                inGame = fallbackInGame;
-                return true;
-            }
-
             state = "frontend";
             inGame = false;
             val = "";
@@ -480,12 +468,11 @@ namespace WardogsProfitHudApp
         public void Dispose()
         {
             isRunning = false;
+            try { bgWorker.Abort(); } catch { }
         }
     }
 
-
-    // ==================== 메인 컨트롤 폼 ====================
-    public class MainHudControlForm : Form
+public class MainHudControlForm : Form
     {
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int vKey);
