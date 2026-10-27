@@ -27,8 +27,8 @@
 
 👉 **[최신 버전 배포 페이지 바로가기 (v1.0.0)](https://github.com/37song/wardogs_hud/releases/latest)**
 
-* **[추천 압축 파일 다운로드 (WARDOGS_PROFIT_HUD.zip)](https://github.com/37song/wardogs_hud/releases/download/v1.0.0/WARDOGS_PROFIT_HUD.zip)** *(압축 해제 후 바로 실행)*
-* **[실행 파일 단독 다운로드 (WARDOGS_PROFIT_HUD.exe)](https://github.com/37song/wardogs_hud/releases/download/v1.0.0/WARDOGS_PROFIT_HUD.exe)**
+* **[추천 압축 파일 다운로드 (WARDOGS 수익 HUD.zip)](./WARDOGS%20%EC%88%98%EC%9D%B5%20HUD.zip)** *(압축 해제 후 바로 실행)*
+* **[실행 파일 단독 다운로드 (WARDOGS 수익 HUD.exe)](./WARDOGS%20%EC%88%98%EC%9D%B5%20HUD.exe)**
 
 > **안내**: 윈도우 보안 경고(스마트스크린)가 발생할 경우, **[추가 정보] -> [실행]**을 눌러주시면 정상 실행됩니다.
 
