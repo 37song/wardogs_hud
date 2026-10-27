@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -110,6 +110,12 @@ namespace WardogsProfitHudApp
             public uint Type;
         }
 
+        private struct MemRegion
+        {
+            public long Base;
+            public long Size;
+        }
+
         private const uint PROCESS_VM_READ = 0x0010;
         private const uint PROCESS_QUERY_INFORMATION = 0x0400;
 
@@ -154,11 +160,13 @@ namespace WardogsProfitHudApp
         {
             int steamPid = 0;
             ulong steamId64 = 0UL;
-            IntPtr hHelper = IntPtr.Zero;
-            int helperPid = 0;
+            IntPtr hProc = IntPtr.Zero;
+            int currentPid = 0;
             long cachedAddr = 0;
+            DateTime lastScanTime = DateTime.MinValue;
+
             byte[] fastBuf = new byte[1024];
-            byte[] pageBuf = new byte[1024 * 1024];
+            byte[] pageBuf = new byte[2 * 1024 * 1024];
 
             while (isRunning)
             {
@@ -168,29 +176,41 @@ namespace WardogsProfitHudApp
 
                     if (!IsSteamRunning)
                     {
-                        if (hHelper != IntPtr.Zero) { CloseHandle(hHelper); hHelper = IntPtr.Zero; helperPid = 0; }
+                        if (hProc != IntPtr.Zero) { CloseHandle(hProc); hProc = IntPtr.Zero; currentPid = 0; }
                         cachedAddr = 0;
                         lock (syncLock) { hasData = false; }
                         Thread.Sleep(1000);
                         continue;
                     }
 
-                    Process targetHelper = FindTargetHelper(steamPid);
-                    if (targetHelper == null)
+                    // 1. 대상 프로세스 선정: steam.exe 우선, 없으면 steamwebhelper
+                    int targetPid = 0;
+                    if (steamPid != 0 && ProcessExists(steamPid, "steam"))
+                    {
+                        targetPid = steamPid;
+                    }
+                    else
+                    {
+                        Process helper = FindTargetHelper(steamPid);
+                        if (helper != null) targetPid = helper.Id;
+                    }
+
+                    if (targetPid == 0)
                     {
                         Thread.Sleep(500);
                         continue;
                     }
 
-                    if (targetHelper.Id != helperPid || hHelper == IntPtr.Zero)
+                    if (targetPid != currentPid || hProc == IntPtr.Zero)
                     {
-                        if (hHelper != IntPtr.Zero) CloseHandle(hHelper);
-                        helperPid = targetHelper.Id;
-                        hHelper = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, helperPid);
+                        if (hProc != IntPtr.Zero) CloseHandle(hProc);
+                        currentPid = targetPid;
+                        hProc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, currentPid);
                         cachedAddr = 0;
+                        lastScanTime = DateTime.MinValue;
                     }
 
-                    if (hHelper == IntPtr.Zero)
+                    if (hProc == IntPtr.Zero)
                     {
                         Thread.Sleep(500);
                         continue;
@@ -198,15 +218,15 @@ namespace WardogsProfitHudApp
 
                     bool readSuccess = false;
 
-                    // 1. 빠른 경로: 이전에 찾은 주소 캐시에서 즉시 읽기 (< 1ms)
+                    // 2. 빠른 경로: 이전에 찾은 주소에서 즉시 읽기 (< 0.1ms)
                     if (cachedAddr != 0)
                     {
                         IntPtr nRead;
                         long readStart = Math.Max(0, cachedAddr - 120);
-                        if (ReadProcessMemory(hHelper, (IntPtr)readStart, fastBuf, 600, out nRead) && (int)nRead > 150)
+                        if (ReadProcessMemory(hProc, (IntPtr)readStart, fastBuf, 600, out nRead) && (int)nRead > 150)
                         {
                             string text = Encoding.ASCII.GetString(fastBuf, 0, (int)nRead);
-                            if (text.Contains("profit_loss") && (text.Contains("WARDOGS") || text.Contains("#Status_") || text.Contains("in_profit_or_loss")))
+                            if (text.Contains("profit_loss") && (text.Contains("#Status_") || text.Contains("in_profit_or_loss")))
                             {
                                 string val, state, game, faction;
                                 if (TryParseChunk(text, out val, out state, out game, out faction))
@@ -225,14 +245,15 @@ namespace WardogsProfitHudApp
                         }
                     }
 
-                    // 2. 캐시 실패 시: 대상 프로세스 메모리 검색
-                    if (!readSuccess)
+                    // 3. 캐시가 없거나, 주기적(1.2초마다) 역방향 고속 재스캔 (새 패킷 버퍼 할당 및 사망 시 즉시 감지)
+                    if (!readSuccess || (DateTime.UtcNow - lastScanTime).TotalSeconds >= 1.2)
                     {
                         long foundAddr;
                         string val, state, game, faction;
-                        if (ScanProcessForProfitLoss(hHelper, pageBuf, out foundAddr, out val, out state, out game, out faction))
+                        if (ReverseScan(hProc, pageBuf, out foundAddr, out val, out state, out game, out faction))
                         {
                             cachedAddr = foundAddr;
+                            lastScanTime = DateTime.UtcNow;
                             lock (syncLock)
                             {
                                 curVal = val;
@@ -245,37 +266,17 @@ namespace WardogsProfitHudApp
                         }
                     }
 
-                    // 만약 주 helper에서 못 찾았다면 모든 steamwebhelper 중에서 검색
-                    if (!readSuccess)
+                    // steam.exe에서 못 찾았다면 steamwebhelper로 전환 시도
+                    if (!readSuccess && currentPid == steamPid)
                     {
-                        Process[] allHelpers = Process.GetProcessesByName("steamwebhelper");
-                        foreach (Process p in allHelpers)
+                        Process helper = FindTargetHelper(steamPid);
+                        if (helper != null && helper.Id != steamPid)
                         {
-                            if (p.Id == helperPid) continue;
-                            IntPtr hAlt = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, p.Id);
-                            if (hAlt != IntPtr.Zero)
-                            {
-                                long foundAddr;
-                                string val, state, game, faction;
-                                if (ScanProcessForProfitLoss(hAlt, pageBuf, out foundAddr, out val, out state, out game, out faction))
-                                {
-                                    CloseHandle(hHelper);
-                                    hHelper = hAlt;
-                                    helperPid = p.Id;
-                                    cachedAddr = foundAddr;
-                                    lock (syncLock)
-                                    {
-                                        curVal = val;
-                                        curState = state;
-                                        curGame = game;
-                                        curFaction = faction;
-                                        hasData = true;
-                                    }
-                                    readSuccess = true;
-                                    break;
-                                }
-                                CloseHandle(hAlt);
-                            }
+                            CloseHandle(hProc);
+                            currentPid = helper.Id;
+                            hProc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, currentPid);
+                            cachedAddr = 0;
+                            lastScanTime = DateTime.MinValue;
                         }
                     }
                 }
@@ -284,7 +285,17 @@ namespace WardogsProfitHudApp
                 Thread.Sleep(100);
             }
 
-            if (hHelper != IntPtr.Zero) CloseHandle(hHelper);
+            if (hProc != IntPtr.Zero) CloseHandle(hProc);
+        }
+
+        private static bool ProcessExists(int pid, string expectedName)
+        {
+            try
+            {
+                Process p = Process.GetProcessById(pid);
+                return p != null && !p.HasExited && p.ProcessName.IndexOf(expectedName, StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+            catch { return false; }
         }
 
         private void CheckProcesses(out int steamPid, ref ulong steamId64)
@@ -304,7 +315,7 @@ namespace WardogsProfitHudApp
             }
             catch { }
 
-            IsSteamRunning = steamPid != 0 && Process.GetProcessesByName("steam").Length > 0;
+            IsSteamRunning = steamPid != 0 && ProcessExists(steamPid, "steam");
 
             bool wardogsFound = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Length > 0;
             if (!wardogsFound)
@@ -356,7 +367,7 @@ namespace WardogsProfitHudApp
             return procs[0];
         }
 
-        private bool ScanProcessForProfitLoss(IntPtr hProc, byte[] pageBuf, out long foundAddr, out string val, out string state, out string game, out string faction)
+        private bool ReverseScan(IntPtr hProc, byte[] pageBuf, out long foundAddr, out string val, out string state, out string game, out string faction)
         {
             foundAddr = 0;
             val = "";
@@ -365,7 +376,7 @@ namespace WardogsProfitHudApp
             faction = "";
 
             long addr = 0;
-            byte[] needle = Encoding.ASCII.GetBytes("profit_loss");
+            List<MemRegion> regions = new List<MemRegion>();
 
             while (addr < 0x7FFFFFFF0000L && isRunning)
             {
@@ -378,44 +389,66 @@ namespace WardogsProfitHudApp
 
                 if (mbi.State == 0x1000 && (mbi.Protect & 0x04) != 0 && (mbi.Protect & 0x100) == 0)
                 {
-                    long curOffset = 0;
-                    while (curOffset < size && isRunning)
-                    {
-                        int toRead = (int)Math.Min((long)pageBuf.Length, size - curOffset);
-                        IntPtr nRead;
-                        if (ReadProcessMemory(hProc, (IntPtr)(baseAddr + curOffset), pageBuf, toRead, out nRead))
-                        {
-                            int bytesRead = (int)nRead;
-                            int idx = 0;
-                            while (idx <= bytesRead - needle.Length)
-                            {
-                                int matchIdx = FindBytesSub(pageBuf, idx, bytesRead - idx, needle, 0, needle.Length);
-                                if (matchIdx == -1) break;
-
-                                int start = Math.Max(0, matchIdx - 100);
-                                int chunkLen = Math.Min(bytesRead - start, 500);
-                                string chunk = Encoding.ASCII.GetString(pageBuf, start, chunkLen);
-
-                                if (chunk.Contains("WARDOGS") || chunk.Contains("PersonaUpdate") || chunk.Contains("#Status_") || chunk.Contains("in_profit_or_loss"))
-                                {
-                                    if (TryParseChunk(chunk, out val, out state, out game, out faction))
-                                    {
-                                        foundAddr = baseAddr + curOffset + matchIdx;
-                                        return true;
-                                    }
-                                }
-                                idx = matchIdx + needle.Length;
-                            }
-                        }
-                        curOffset += toRead;
-                    }
+                    regions.Add(new MemRegion { Base = baseAddr, Size = size });
                 }
                 long nextAddr = baseAddr + size;
                 if (nextAddr <= addr) break;
                 addr = nextAddr;
             }
 
+            byte[] needle = Encoding.ASCII.GetBytes("profit_loss");
+
+            // 최신 할당 메모리부터 역방향 탐색 (높은 주소 -> 낮은 주소)
+            for (int r = regions.Count - 1; r >= 0 && isRunning; r--)
+            {
+                MemRegion reg = regions[r];
+                long offset = reg.Size;
+                while (offset > 0 && isRunning)
+                {
+                    int chunkToRead = (int)Math.Min((long)pageBuf.Length, offset);
+                    long chunkStart = reg.Base + (offset - chunkToRead);
+                    IntPtr nRead;
+                    if (ReadProcessMemory(hProc, (IntPtr)chunkStart, pageBuf, chunkToRead, out nRead))
+                    {
+                        int bytesRead = (int)nRead;
+                        int idx = FindBytesSubReverse(pageBuf, 0, bytesRead, needle);
+                        while (idx != -1 && isRunning)
+                        {
+                            int start = Math.Max(0, idx - 80);
+                            int chunkLen = Math.Min(bytesRead - start, 500);
+                            string chunk = Encoding.ASCII.GetString(pageBuf, start, chunkLen);
+
+                            if (chunk.Contains("#Status_") || chunk.Contains("in_profit_or_loss") || chunk.Contains("steam_display"))
+                            {
+                                if (TryParseChunk(chunk, out val, out state, out game, out faction))
+                                {
+                                    foundAddr = chunkStart + idx;
+                                    return true;
+                                }
+                            }
+                            idx = (idx > 0) ? FindBytesSubReverse(pageBuf, 0, idx, needle) : -1;
+                        }
+                    }
+                    offset -= chunkToRead;
+                }
+            }
+
             return false;
+        }
+
+        private static int FindBytesSubReverse(byte[] src, int startIdx, int count, byte[] needle)
+        {
+            int max = startIdx + count - needle.Length;
+            for (int i = max; i >= startIdx; i--)
+            {
+                bool ok = true;
+                for (int j = 0; j < needle.Length; j++)
+                {
+                    if (src[i + j] != needle[j]) { ok = false; break; }
+                }
+                if (ok) return i;
+            }
+            return -1;
         }
 
         private static bool TryParseChunk(string chunk, out string val, out string state, out string game, out string faction)
@@ -442,26 +475,12 @@ namespace WardogsProfitHudApp
             return true;
         }
 
-        private static int FindBytesSub(byte[] src, int startIdx, int count, byte[] needle, int needleStart, int needleLen)
-        {
-            int max = Math.Min(src.Length, startIdx + count) - needleLen;
-            for (int i = startIdx; i <= max; i++)
-            {
-                bool ok = true;
-                for (int j = 0; j < needleLen; j++)
-                {
-                    if (src[i + j] != needle[needleStart + j]) { ok = false; break; }
-                }
-                if (ok) return i;
-            }
-            return -1;
-        }
-
         public void Dispose()
         {
             isRunning = false;
         }
     }
+
 
     // ==================== 메인 컨트롤 폼 ====================
     public class MainHudControlForm : Form
