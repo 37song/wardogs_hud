@@ -1,3 +1,4 @@
+using System.Management;
 ﻿using System;
 
 
@@ -230,10 +231,17 @@ File.WriteAllText(Path.Combine(Environment.GetFolderPath(Environment.SpecialFold
 // =========================================================================
 public class SteamWebProfitReader : IDisposable
 {
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
     private System.Net.HttpListener _listener;
     private System.Threading.Thread _listenThread;
     private System.Threading.Thread _watchdogThread;
     private volatile bool _running;
+    private volatile bool _hasReceivedAnyData = false;
     private readonly object _lock = new object();
 
     private string _curVal = "";
@@ -307,23 +315,23 @@ public class SteamWebProfitReader : IDisposable
                 "    let txt = '';\n" +
                 "    if (el && el.innerText) { txt = el.innerText; }\n" +
                 "    else {\n" +
-                "      const box = document.querySelector('.currentUserContainer.ingame') || document.querySelector('.currentUserContainer');\n" +
-                "      if (box) {\n" +
-                "        const divs = box.querySelectorAll('div, span');\n" +
-                "        for (let i = 0; i < divs.length; i++) {\n" +
-                "          const t = (divs[i].innerText || '').trim();\n" +
-                "          if (/^[+-]?\\s*\\$?[\\d,]+/.test(t)) { txt = t; break; }\n" +
+                "      const box = document.querySelector('.currentUserContainer.ingame');\n" +
+                "      if (box && box.innerText) {\n" +
+                "        const lines = box.innerText.split('\\n');\n" +
+                "        for (let i = 0; i < lines.length; i++) {\n" +
+                "          if (lines[i].indexOf('$') !== -1 || lines[i].indexOf('수익') !== -1 || lines[i].indexOf('손실') !== -1) {\n" +
+                "            txt = lines[i];\n" +
+                "            break;\n" +
+                "          }\n" +
                 "        }\n" +
                 "      }\n" +
                 "    }\n" +
-                "    if (!txt) return;\n" +
-                "    const m = txt.match(/[+-]?\\s*\\$?[\\d,]+/);\n" +
-                "    if (m) {\n" +
-                "      const clean = m[0].replace(/\\s+/g, '');\n" +
-                "      fetch('http://127.0.0.1:27060/profit/?val=' + encodeURIComponent(clean), { mode: 'no-cors' }).catch(()=>{});\n" +
-                "    }\n" +
+                "    let port = 27060;\n" +
+                "    let url = 'http://127.0.0.1:' + port + '/profit?val=' + encodeURIComponent(txt) + '&st=game';\n" +
+                "    fetch(url, { mode: 'no-cors' }).catch(function(){});\n" +
                 "  }\n" +
                 "  setInterval(sync, 1000);\n" +
+                "  sync();\n" +
                 "})();";
 
             System.IO.File.WriteAllText(manifestPath, manifestJson, System.Text.Encoding.UTF8);
@@ -332,17 +340,119 @@ public class SteamWebProfitReader : IDisposable
         catch { }
     }
 
+    public static bool IsEdgeAppRunning()
+    {
+        try
+        {
+            if (_edgeProcess != null && !_edgeProcess.HasExited)
+            {
+                return true;
+            }
+
+            using (var searcher = new System.Management.ManagementObjectSearcher(
+                "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name = 'msedge.exe'"))
+            {
+                foreach (System.Management.ManagementObject obj in searcher.Get())
+                {
+                    object cmdObj = obj["CommandLine"];
+                    if (cmdObj != null)
+                    {
+                        string cmd = cmdObj.ToString();
+                        if (cmd.IndexOf("WardogsSteamProfile", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            int pid = Convert.ToInt32(obj["ProcessId"]);
+                            try { _edgeProcess = System.Diagnostics.Process.GetProcessById(pid); } catch { }
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    public static void FocusExistingEdgeApp()
+    {
+        try
+        {
+            var procs = System.Diagnostics.Process.GetProcessesByName("msedge");
+            foreach (var p in procs)
+            {
+                try
+                {
+                    IntPtr hwnd = p.MainWindowHandle;
+                    if (hwnd != IntPtr.Zero)
+                    {
+                        string title = p.MainWindowTitle;
+                        if (!string.IsNullOrEmpty(title) && (title.IndexOf("Steam", StringComparison.OrdinalIgnoreCase) >= 0 || title.IndexOf("친구", StringComparison.OrdinalIgnoreCase) >= 0))
+                        {
+                            ShowWindow(hwnd, 9); // SW_RESTORE
+                            SetForegroundWindow(hwnd);
+                            return;
+                        }
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+    }
+
+    public static void KillExistingEdgeApp()
+    {
+        try
+        {
+            var pidsToKill = new System.Collections.Generic.List<int>();
+            using (var searcher = new System.Management.ManagementObjectSearcher(
+                "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name = 'msedge.exe'"))
+            {
+                foreach (System.Management.ManagementObject obj in searcher.Get())
+                {
+                    object cmdObj = obj["CommandLine"];
+                    if (cmdObj != null && cmdObj.ToString().IndexOf("WardogsSteamProfile", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        pidsToKill.Add(Convert.ToInt32(obj["ProcessId"]));
+                    }
+                }
+            }
+
+            foreach (int pid in pidsToKill)
+            {
+                try
+                {
+                    var proc = System.Diagnostics.Process.GetProcessById(pid);
+                    proc.Kill();
+                    proc.WaitForExit(1000);
+                }
+                catch { }
+            }
+        }
+        catch { }
+    }
+
     public static void LaunchEdgeApp(bool showNormalWindow)
     {
         try
         {
+            // Single Instance Guard: If already running, do NOT launch another one!
+            if (IsEdgeAppRunning())
+            {
+                if (showNormalWindow)
+                {
+                    FocusExistingEdgeApp();
+                }
+                return;
+            }
+
             EnsureExtensionFiles();
             string edge = FindEdgeExe();
             string profile = ProfileDir;
             string ext = ExtensionDir;
 
+            // Flags prevent "Allow access to other apps" (PNA prompt) popup:
             string args = string.Format(
-                "--user-data-dir=\"{0}\" --load-extension=\"{1}\" --no-first-run --no-default-browser-check --app=https://steamcommunity.com/chat",
+                "--user-data-dir=\"{0}\" --load-extension=\"{1}\" --no-first-run --no-default-browser-check --disable-features=BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessSendPreflights --unsafely-treat-insecure-origin-as-secure=http://127.0.0.1:27060 --app=https://steamcommunity.com/chat",
                 profile, ext
             );
 
@@ -358,24 +468,59 @@ public class SteamWebProfitReader : IDisposable
     {
         try
         {
-            if (_edgeProcess != null && !_edgeProcess.HasExited)
-            {
-                try { _edgeProcess.Kill(); } catch { }
-            }
+            // 1. Force kill all Edge processes using WardogsSteamProfile
+            KillExistingEdgeApp();
+            System.Threading.Thread.Sleep(500);
 
+            // 2. Delete Default folder with retries to clear cookies & sessions completely
             string profile = ProfileDir;
             string defaultDir = System.IO.Path.Combine(profile, "Default");
-            if (System.IO.Directory.Exists(defaultDir))
+
+            bool deleted = false;
+            for (int r = 0; r < 5; r++)
             {
-                try { System.IO.Directory.Delete(defaultDir, true); } catch { }
+                if (!System.IO.Directory.Exists(defaultDir))
+                {
+                    deleted = true;
+                    break;
+                }
+                try
+                {
+                    System.IO.Directory.Delete(defaultDir, true);
+                    deleted = true;
+                    break;
+                }
+                catch
+                {
+                    KillExistingEdgeApp();
+                    System.Threading.Thread.Sleep(500);
+                }
             }
 
-            System.Windows.Forms.MessageBox.Show("기존 스팀 로그인 정보가 초기화되었습니다.\n새로운 아이디로 로그인해 주세요.", "계정 변경");
+            if (deleted)
+            {
+                System.Windows.Forms.MessageBox.Show(
+                    "스팀 로그인 정보가 완전히 초기화되었습니다.\n새로운 아이디로 로그인해 주세요.",
+                    "계정 변경 완료",
+                    System.Windows.Forms.MessageBoxButtons.OK,
+                    System.Windows.Forms.MessageBoxIcon.Information
+                );
+            }
+            else
+            {
+                System.Windows.Forms.MessageBox.Show(
+                    "일부 파일이 잠겨 있어 완전히 삭제되지 않았습니다.\n프로그램을 재시작한 후 다시 시도해 주세요.",
+                    "초기화 안내",
+                    System.Windows.Forms.MessageBoxButtons.OK,
+                    System.Windows.Forms.MessageBoxIcon.Warning
+                );
+            }
+
             LaunchEdgeApp(true);
         }
         catch (Exception ex)
         {
-            System.Windows.Forms.MessageBox.Show("초기화 오류: " + ex.Message, "오류");
+            System.Windows.Forms.MessageBox.Show("초기화 실패: " + ex.Message, "오류");
         }
     }
 
@@ -401,7 +546,10 @@ public class SteamWebProfitReader : IDisposable
         System.Threading.ThreadPool.QueueUserWorkItem((_) =>
         {
             System.Threading.Thread.Sleep(1500);
-            LaunchEdgeApp(false);
+            if (!IsEdgeAppRunning())
+            {
+                LaunchEdgeApp(false);
+            }
         });
 
         _watchdogThread = new System.Threading.Thread(WatchdogLoop);
@@ -414,15 +562,19 @@ public class SteamWebProfitReader : IDisposable
     {
         while (_running)
         {
-            System.Threading.Thread.Sleep(5000);
+            System.Threading.Thread.Sleep(15000);
             if (!_running) break;
 
-            if ((DateTime.Now - _lastReceived).TotalSeconds > 15)
+            // Absolute Single Instance Guard:
+            // NEVER launch if Edge is already running (whether user is logging in, or pending prompt)
+            if (IsEdgeAppRunning())
+                continue;
+
+            // Only auto-restore if user has successfully connected before (logged in),
+            // and no data received for 30s, and Edge is completely closed!
+            if (_hasReceivedAnyData && (DateTime.Now - _lastReceived).TotalSeconds > 30)
             {
-                if (_edgeProcess == null || _edgeProcess.HasExited)
-                {
-                    LaunchEdgeApp(false);
-                }
+                LaunchEdgeApp(false);
             }
         }
     }
@@ -479,62 +631,38 @@ public class SteamWebProfitReader : IDisposable
             var resp = context.Response;
 
             resp.Headers.Add("Access-Control-Allow-Origin", "*");
-            resp.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            resp.Headers.Add("Access-Control-Allow-Methods", "GET, OPTIONS");
             resp.Headers.Add("Access-Control-Allow-Headers", "*");
             resp.Headers.Add("Access-Control-Allow-Private-Network", "true");
 
             if (req.HttpMethod == "OPTIONS")
             {
-                resp.StatusCode = 200;
+                resp.StatusCode = 204;
                 resp.Close();
                 return;
             }
 
-            string val = req.QueryString["val"];
-            if (!string.IsNullOrEmpty(val))
+            string rawVal = req.QueryString["val"] ?? "";
+            string st = req.QueryString["st"] ?? "frontend";
+            string fac = req.QueryString["fac"] ?? "";
+
+            string cleanVal = rawVal;
+            if (!string.IsNullOrEmpty(rawVal))
             {
-                val = val.Trim();
-                val = val.Replace("수익", "").Replace("손실", "").Trim();
-                var m = System.Text.RegularExpressions.Regex.Match(val, @"[+-]?\s*\$?[\d,]+");
-                if (m.Success)
+                var match = System.Text.RegularExpressions.Regex.Match(rawVal, @"([+-]?\s*\$?[\d,]+)");
+                if (match.Success)
                 {
-                    val = m.Value.Replace(" ", "");
+                    cleanVal = match.Groups[1].Value.Replace(" ", "");
                 }
+            }
 
-                lock (_lock)
-                {
-                    _curVal = val;
-                    _lastReceived = DateTime.Now;
-
-                    if (val.Contains("-"))
-                    {
-                        _curState = "loss";
-                    }
-                    else if (val == "$0" || val == "0" || val == "+$0")
-                    {
-                        _curState = "frontend";
-                    }
-                    else
-                    {
-                        _curState = "profit";
-                    }
-                }
-
-                if (_relayPort > 0)
-                {
-                    int rPort = _relayPort;
-                    string relayVal = val;
-                    System.Threading.ThreadPool.QueueUserWorkItem((_) =>
-                    {
-                        try
-                        {
-                            var rReq = System.Net.WebRequest.Create(string.Format("http://127.0.0.1:{0}/profit/?val={1}", rPort, System.Uri.EscapeDataString(relayVal)));
-                            rReq.Timeout = 500;
-                            using (var rResp = rReq.GetResponse()) { }
-                        }
-                        catch { }
-                    });
-                }
+            lock (_lock)
+            {
+                _curVal = cleanVal;
+                _curState = st;
+                _curFaction = fac;
+                _lastReceived = DateTime.Now;
+                _hasReceivedAnyData = true;
             }
 
             byte[] buf = System.Text.Encoding.UTF8.GetBytes("OK");
@@ -572,14 +700,11 @@ public class SteamWebProfitReader : IDisposable
     public void Dispose()
     {
         _running = false;
-        if (_listener != null)
-        {
-            try { _listener.Stop(); _listener.Close(); } catch { }
-        }
-        if (_edgeProcess != null && !_edgeProcess.HasExited)
-        {
-            try { _edgeProcess.Kill(); } catch { }
-        }
+        try { if (_listener != null && _listener.IsListening) _listener.Stop(); } catch { }
+        try { if (_listener != null) _listener.Close(); } catch { }
+        try { if (_listenThread != null) _listenThread.Abort(); } catch { }
+        try { if (_watchdogThread != null) _watchdogThread.Abort(); } catch { }
+        try { KillExistingEdgeApp(); } catch { }
     }
 }
 
