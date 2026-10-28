@@ -289,7 +289,7 @@ public class SteamWebProfitReader : IDisposable
         return "msedge.exe";
     }
 
-    public static void EnsureExtensionFiles()
+            public static void EnsureExtensionFiles()
     {
         try
         {
@@ -301,8 +301,12 @@ public class SteamWebProfitReader : IDisposable
                 "  \"manifest_version\": 3,\n" +
                 "  \"name\": \"WARDOGS Auto Sync\",\n" +
                 "  \"version\": \"1.0\",\n" +
+                "  \"host_permissions\": [\n" +
+                "    \"http://127.0.0.1:27060/*\",\n" +
+                "    \"https://steamcommunity.com/*\"\n" +
+                "  ],\n" +
                 "  \"content_scripts\": [{\n" +
-                "    \"matches\": [\"https://steamcommunity.com/chat*\"],\n" +
+                "    \"matches\": [\"https://steamcommunity.com/*\"],\n" +
                 "    \"js\": [\"content.js\"],\n" +
                 "    \"run_at\": \"document_idle\"\n" +
                 "  }]\n" +
@@ -334,8 +338,9 @@ public class SteamWebProfitReader : IDisposable
                 "  sync();\n" +
                 "})();";
 
-            System.IO.File.WriteAllText(manifestPath, manifestJson, System.Text.Encoding.UTF8);
-            System.IO.File.WriteAllText(contentPath, contentJs, System.Text.Encoding.UTF8);
+            var utf8NoBom = new System.Text.UTF8Encoding(false);
+            System.IO.File.WriteAllText(manifestPath, manifestJson, utf8NoBom);
+            System.IO.File.WriteAllText(contentPath, contentJs, utf8NoBom);
         }
         catch { }
     }
@@ -1476,7 +1481,7 @@ this.Controls.Add(pnlPreview);
 this.Controls.Add(grpControls);
 
         Button btnSteamLogin = new Button();
-        btnSteamLogin.Text = "🌐 스팀 로그인 (우클릭: 계정변경)";
+        btnSteamLogin.Text = "스팀 로그인 (우클릭: 계정변경)";
         btnSteamLogin.Font = new Font("맑은 고딕", 9f, FontStyle.Bold);
         btnSteamLogin.BackColor = Color.FromArgb(31, 110, 165);
         btnSteamLogin.ForeColor = Color.White;
