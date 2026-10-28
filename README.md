@@ -22,7 +22,7 @@
 
 ---
 
-## ⚡ 빠른 시작 (사용 방법)
+## ⚡ 사용 방법
 
 1. [최신 Releases](https://github.com/37song/wardogs_hud/releases)에서 `WARDOGS_PROFIT_HUD.zip`을 다운로드하고 압축을 풉니다.
 2. `WARDOGS_PROFIT_HUD.exe`를 실행합니다.
