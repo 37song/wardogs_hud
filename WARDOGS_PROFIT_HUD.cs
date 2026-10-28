@@ -581,26 +581,22 @@ public class SteamWebProfitReader : IDisposable
 
 
                 public static void EnsureExtensionFiles()
-
     {
-
         try
-
         {
-
             string ext = ExtensionDir;
-
             string manifestPath = System.IO.Path.Combine(ext, "manifest.json");
-
+            string bgPath = System.IO.Path.Combine(ext, "background.js");
             string contentPath = System.IO.Path.Combine(ext, "content.js");
-
-
 
             string manifestJson = "{\n" +
                 "  \"manifest_version\": 3,\n" +
                 "  \"name\": \"WARDOGS Auto Sync\",\n" +
                 "  \"version\": \"1.0\",\n" +
-                "  \"host_permissions\": [\"http://127.0.0.1:27060/*\", \"http://127.0.0.1:49512/*\", \"http://127.0.0.1:49513/*\", \"https://steamcommunity.com/*\", \"https://*.steampowered.com/*\"],\n" +
+                "  \"host_permissions\": [\"http://127.0.0.1/*\", \"http://localhost/*\"],\n" +
+                "  \"background\": {\n" +
+                "    \"service_worker\": \"background.js\"\n" +
+                "  },\n" +
                 "  \"content_scripts\": [{\n" +
                 "    \"matches\": [\"https://steamcommunity.com/*\", \"https://login.steampowered.com/*\", \"https://*.steampowered.com/*\"],\n" +
                 "    \"js\": [\"content.js\"],\n" +
@@ -608,7 +604,20 @@ public class SteamWebProfitReader : IDisposable
                 "  }]\n" +
                 "}";
 
-
+            string bgJs = "const PORTS = [27060, 49512, 49513];\n" +
+                "function sendToHud(val, st) {\n" +
+                "  const v = encodeURIComponent(val || '');\n" +
+                "  const s = encodeURIComponent(st || 'game');\n" +
+                "  for (let i = 0; i < PORTS.length; i++) {\n" +
+                "    fetch('http://127.0.0.1:' + PORTS[i] + '/profit/?val=' + v + '&st=' + s, { mode: 'no-cors' }).catch(function(){});\n" +
+                "  }\n" +
+                "}\n" +
+                "chrome.runtime.onMessage.addListener(function(msg) {\n" +
+                "  if (msg && msg.val !== undefined) {\n" +
+                "    sendToHud(msg.val, msg.st);\n" +
+                "  }\n" +
+                "});\n" +
+                "setInterval(function() { sendToHud('', 'ping'); }, 2000);";
 
             string contentJs = "(function() {\n" +
                 "  const S = \"#friendslist-container > div > div.chat_main_flex.displayRow.Panel.Focusable > div.DropTarget.friendsListContainer.fullheight.Panel.Focusable > div > div.friendListHeaderContainer.titleBarContainer > div.currentUserContainer.ingame > div > div.labelHolder.ingame > div._9lhfreYH7b4- > div:nth-child(2)\";\n" +
@@ -627,28 +636,20 @@ public class SteamWebProfitReader : IDisposable
                 "  }\n" +
                 "  function sync() {\n" +
                 "    let txt = findProfit();\n" +
-                "    const ports = [27060, 49512, 49513];\n" +
-                "    for (let i = 0; i < ports.length; i++) {\n" +
-                "      let url = 'http://127.0.0.1:' + ports[i] + '/profit/?val=' + encodeURIComponent(txt) + '&st=game';\n" +
-                "      fetch(url, { mode: 'no-cors' }).catch(function(){});\n" +
-                "    }\n" +
+                "    try {\n" +
+                "      chrome.runtime.sendMessage({ val: txt, st: 'game' });\n" +
+                "    } catch(e) {}\n" +
                 "  }\n" +
                 "  setInterval(sync, 1000);\n" +
                 "  sync();\n" +
                 "})();";
 
-
-
             var utf8NoBom = new System.Text.UTF8Encoding(false);
-
             System.IO.File.WriteAllText(manifestPath, manifestJson, utf8NoBom);
-
+            System.IO.File.WriteAllText(bgPath, bgJs, utf8NoBom);
             System.IO.File.WriteAllText(contentPath, contentJs, utf8NoBom);
-
         }
-
         catch { }
-
     }
 
 
