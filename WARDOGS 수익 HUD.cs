@@ -606,385 +606,1210 @@ IsWardogsRunning = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Le
 
 
 
-                private static ulong ExtractOwnerSteamId(byte[] buf, int needlePos)
-        {
-            int start = Math.Max(0, needlePos - 300);
-            for (int j = needlePos - 12; j >= start; j--)
-            {
-                if (buf[j] == 0x09 && buf[j + 9] == 0x10 && buf[j + 10] == 0x01 && buf[j + 11] == 0x18)
-                {
-                    return BitConverter.ToUInt64(buf, j + 1);
-                }
-            }
-            for (int j = needlePos - 8; j >= start; j--)
-            {
-                if (buf[j + 4] == 0x01 && buf[j + 5] == 0x00 && buf[j + 6] == 0x10 && buf[j + 7] == 0x01)
-                {
-                    return BitConverter.ToUInt64(buf, j);
-                }
-            }
-            return 0UL;
-        }
+private void WorkerLoop()
 
-        private void WorkerLoop()
-        {
-            int steamPid = 0;
-            ulong steamId64 = 0UL;
-            IntPtr hProc = IntPtr.Zero;
-            int currentPid = 0;
-            long cachedAddr = 0;
-            int pollTick = 0;
-            int missingMatchTicks = 0;
-            int lobbyConfirmTicks = 0;
-            byte[] pageBuf = new byte[65536];
 
-            while (isRunning)
-            {
-                try
-                {
-                    uint activeUser;
-                    CheckProcesses(out steamPid, out activeUser, ref steamId64);
-                    if (!IsSteamRunning || !IsWardogsRunning)
-                    {
-                        if (!IsSteamRunning && hProc != IntPtr.Zero) { CloseHandle(hProc); hProc = IntPtr.Zero; currentPid = 0; }
-                        cachedAddr = 0;
-                        lock (syncLock) { hasData = false; curVal = ""; curState = "frontend"; }
-                        Thread.Sleep(1000);
-                        continue;
-                    }
 
-                    // 1. Prefer steamwebhelper (renders Steam Friends list UI with real-time in-place status)
-                    int targetPid = 0;
-                    bool isRenderer = false;
-                    Process renderer = FindTargetRenderer();
-                    if (renderer != null && !renderer.HasExited)
-                    {
-                        targetPid = renderer.Id;
-                        isRenderer = true;
-                    }
+{
 
-                    // 2. Fallback to native steam.exe if renderer is not found
-                    if (targetPid == 0 && steamPid != 0)
-                    {
-                        try
-                        {
-                            Process sp = Process.GetProcessById(steamPid);
-                            if (!sp.HasExited) { targetPid = steamPid; isRenderer = false; }
-                        }
-                        catch { }
-                    }
-                    if (targetPid == 0)
-                    {
-                        Process[] sps = Process.GetProcessesByName("steam");
-                        if (sps != null && sps.Length > 0 && !sps[0].HasExited) { targetPid = sps[0].Id; isRenderer = false; }
-                    }
-                    if (targetPid == 0)
-                    {
-                        Thread.Sleep(500);
-                        continue;
-                    }
 
-                    if (targetPid != currentPid || hProc == IntPtr.Zero)
-                    {
-                        if (hProc != IntPtr.Zero) CloseHandle(hProc);
-                        currentPid = targetPid;
-                        hProc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, currentPid);
-                        cachedAddr = 0;
-                    }
-                    if (hProc == IntPtr.Zero)
-                    {
-                        Thread.Sleep(500);
-                        continue;
-                    }
 
-                    string val = "", state = "";
-                    long foundAddr = 0;
-                    bool inGame = false;
-                    bool ok = false;
+int steamPid = 0;
 
-                    // Periodic full re-scan every 10 seconds (40 ticks) to keep sync without disrupting cache
-                    if (++pollTick % 40 == 0)
-                    {
-                        cachedAddr = 0;
-                    }
 
-                    // 1. Cached fast read (0.01ms) with owner verification
-                    if (cachedAddr > 0)
-                    {
-                        IntPtr nRead;
-                        long readStart = Math.Max(0, cachedAddr - 250);
-                        int readOffset = (int)(cachedAddr - readStart);
-                        if (ReadProcessMemory(hProc, (IntPtr)readStart, pageBuf, 512, out nRead) && (int)nRead > readOffset + 64)
-                        {
-                            ulong cacheOwner = ExtractOwnerSteamId(pageBuf, readOffset);
-                            if (steamId64 != 0 && cacheOwner != steamId64)
-                            {
-                                // Invalidate cache immediately if not strictly matching our SteamID64!
-                                cachedAddr = 0;
-                            }
-                            else
-                            {
-                                string body = Encoding.ASCII.GetString(pageBuf, readOffset, (int)nRead - readOffset);
-                                Match mp = Regex.Match(body, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
-                                if (mp.Success && !body.Contains("match_lost"))
-                                {
-                                    val = mp.Groups[1].Value.Replace(" ", "");
-                                    Match mst = Regex.Match(body, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                    if (mst.Success) state = mst.Groups[1].Value.ToLowerInvariant();
-                                    else state = val.Contains("-") ? "loss" : "profit";
-                                    inGame = true;
-                                    ok = true;
-                                }
-                                else if (body.Contains("#Status_Frontend") || body.Contains("#Status_ShootingRange"))
-                                {
-                                    state = body.Contains("#Status_ShootingRange") ? "shootingrange" : "frontend";
-                                    inGame = false;
-                                    val = "";
-                                    ok = true;
-                                    cachedAddr = 0;
-                                }
-                                else
-                                {
-                                    cachedAddr = 0;
-                                }
-                            }
-                        }
-                        else
-                        {
-                            cachedAddr = 0;
-                        }
-                    }
 
-                    // 2. Full scan for steam_display with strict owner verification
-                    if (!ok)
-                    {
-                        long scanStart = 0x10000000000L;
-                        long scanEnd = isRenderer ? 0x25000000000L : 0x40000000000L;
-                        ok = ScanNativeStreamRange(hProc, scanStart, scanEnd, activeUser, steamId64, isRenderer, pageBuf, out foundAddr, out val, out state, out inGame);
-                        if (ok && foundAddr > 0 && inGame)
-                        {
-                            cachedAddr = foundAddr;
-                        }
-                        else
-                        {
-                            cachedAddr = 0;
-                        }
-                    }
+ulong steamId64 = 0UL;
 
-                    lock (syncLock)
+
+
+IntPtr hProc = IntPtr.Zero;
+
+
+
+int currentPid = 0;
+
+
+
+long cachedAddr = 0;
+
+
+
+int pollTick = 0;
+
+int missingMatchTicks = 0;
+
+
+
+byte[] pageBuf = new byte[65536];
+
+
+
+while (isRunning)
+
+
+
+{
+
+
+
+try
+
+
+
+{
+
+
+
+uint activeUser;
+
+
+
+CheckProcesses(out steamPid, out activeUser, ref steamId64);
+
+
+
+if (!IsSteamRunning || !IsWardogsRunning)
+
+
+
+{
+
+
+
+if (!IsSteamRunning && hProc != IntPtr.Zero) { CloseHandle(hProc); hProc = IntPtr.Zero; currentPid = 0; }
+
+
+
+cachedAddr = 0;
+
+
+
+lock (syncLock) { hasData = false; curVal = ""; curState = "frontend"; }
+
+
+
+Thread.Sleep(1000);
+
+
+
+continue;
+
+
+
+}
+
+
+
+// 1. Prefer steamwebhelper (renders Steam Friends list UI with real-time in-place status)
+
+
+
+int targetPid = 0;
+
+
+
+bool isRenderer = false;
+
+
+
+Process renderer = FindTargetRenderer();
+
+
+
+if (renderer != null && !renderer.HasExited)
+
+
+
+{
+
+
+
+targetPid = renderer.Id;
+
+
+
+isRenderer = true;
+
+
+
+}
+
+
+
+// 2. Fallback to native steam.exe if renderer is not found
+
+
+
+if (targetPid == 0 && steamPid != 0)
+
+
+
+{
+
+
+
+try
+
+
+
+{
+
+
+
+Process sp = Process.GetProcessById(steamPid);
+
+
+
+if (!sp.HasExited) { targetPid = steamPid; isRenderer = false; }
+
+
+
+}
+
+
+
+catch { }
+
+
+
+}
+
+
+
+if (targetPid == 0)
+
+
+
+{
+
+
+
+Process[] sps = Process.GetProcessesByName("steam");
+
+
+
+if (sps != null && sps.Length > 0 && !sps[0].HasExited) { targetPid = sps[0].Id; isRenderer = false; }
+
+
+
+}
+
+
+
+if (targetPid == 0)
+
+
+
+{
+
+
+
+Thread.Sleep(500);
+
+
+
+continue;
+
+
+
+}
+
+
+
+if (targetPid != currentPid || hProc == IntPtr.Zero)
+
+
+
+{
+
+
+
+if (hProc != IntPtr.Zero) CloseHandle(hProc);
+
+
+
+currentPid = targetPid;
+
+
+
+hProc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, currentPid);
+
+
+
+cachedAddr = 0;
+
+
+
+}
+
+
+
+if (hProc == IntPtr.Zero)
+
+
+
+{
+
+
+
+Thread.Sleep(500);
+
+
+
+continue;
+
+
+
+}
+
+
+
+string val = "", state = "";
+
+
+
+long foundAddr = 0;
+
+
+
+bool inGame = false;
+
+
+
+bool ok = false;
+
+
+
+// Periodic full re-scan every 1.5 seconds to detect match start/end accurately
+
+
+
+if (++pollTick % 6 == 0)
+
+
+
+{
+
+
+
+cachedAddr = 0;
+
+
+
+}
+
+
+
+// 1. Cached fast read (0.01ms)
+
+
+
+if (cachedAddr > 0)
+
+
+
+{
+
+
+
+IntPtr nRead;
+
+
+
+if (ReadProcessMemory(hProc, (IntPtr)cachedAddr, pageBuf, 256, out nRead) && (int)nRead > 64)
+
+
+
+{
+
+
+
+string body = Encoding.ASCII.GetString(pageBuf, 0, (int)nRead);
+
+
+
+Match ms = Regex.Match(body, @"#Status_(\w+)");
+
+
+
+if (ms.Success)
+
+
+
+{
+
+
+
+string st = ms.Groups[1].Value;
+
+
+
+if (st == "KOTH" && !body.Contains("unknown") && !body.Contains("match_lost"))
+
+
+
+{
+
+
+
+Match mp = Regex.Match(body, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
+
+
+
+if (mp.Success)
+
+
+
+{
+
+
+
+val = mp.Groups[1].Value.Replace(" ", "");
+
+
+
+Match mst = Regex.Match(body, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+
+
+
+if (mst.Success) state = mst.Groups[1].Value.ToLowerInvariant();
+
+
+
+else state = val.Contains("-") ? "loss" : "profit";
+
+
+
+inGame = true;
+
+
+
+ok = true;
+
+
+
+}
+
+
+
+}
+
+
+
+else
+
+
+
+{
+
+
+
+// Returned to frontend/menu
+
+
+
+state = "frontend";
+
+
+
+inGame = false;
+
+
+
+val = "";
+
+
+
+ok = true;
+
+
+
+cachedAddr = 0;
+
+
+
+}
+
+
+
+}
+
+
+
+}
+
+
+
+if (!ok)
+
+
+
+{
+
+
+
+cachedAddr = 0;
+
+
+
+}
+
+
+
+}
+
+
+
+// 2. Full scan for steam_display (tracks real-time status transitions)
+
+
+
+if (!ok)
+
+
+
+{
+
+
+
+long scanStart = 0x10000000000L;
+
+
+
+long scanEnd = isRenderer ? 0x25000000000L : 0x40000000000L;
+
+
+
+ok = ScanNativeStreamRange(hProc, scanStart, scanEnd, activeUser, steamId64, isRenderer, pageBuf, out foundAddr, out val, out state, out inGame);
+
+
+
+if (ok && foundAddr > 0 && inGame)
+
+
+
+{
+
+
+
+cachedAddr = foundAddr;
+
+
+
+}
+
+
+
+else
+
+
+
+{
+
+
+
+cachedAddr = 0;
+
+
+
+}
+
+
+
+}
+
+
+
+lock (syncLock)
+
                     {
+
                         if (inGame && !string.IsNullOrEmpty(val))
+
                         {
-                            // In-game match data actively confirmed for current user
+
                             curVal = val;
+
                             curState = state;
+
                             hasData = true;
+
                             missingMatchTicks = 0;
-                            lobbyConfirmTicks = 0;
+
                         }
+
                         else if (ok && (state == "frontend" || state == "shootingrange"))
+
                         {
-                            // Lobby packet observed for current user
-                            if (hasData && IsWardogsRunning)
-                            {
-                                if (++lobbyConfirmTicks <= 10)
-                                {
-                                    // Hold previous profit value firmly!
-                                }
-                                else
-                                {
-                                    curVal = "";
-                                    curState = state;
-                                    hasData = false;
-                                    missingMatchTicks = 0;
-                                    lobbyConfirmTicks = 0;
-                                }
-                            }
-                            else
-                            {
-                                curVal = "";
-                                curState = state;
-                                hasData = false;
-                                missingMatchTicks = 0;
-                                lobbyConfirmTicks = 0;
-                            }
+
+                            // Explicit lobby/frontend packet confirmed -> switch to lobby immediately
+
+                            curVal = "";
+
+                            curState = state;
+
+                            hasData = false;
+
+                            missingMatchTicks = 0;
+
                         }
+
                         else
+
                         {
-                            lobbyConfirmTicks = 0;
-                            if (hasData && IsWardogsRunning && ++missingMatchTicks <= 20)
+
+                            // Momentary read miss, packet dropout, or re-scan while Wardogs is still running:
+
+                            // Hold previous profit value for up to 3.0s (12 ticks * 250ms) without flickering to idle!
+
+                            if (hasData && IsWardogsRunning && ++missingMatchTicks <= 12)
+
                             {
+
                                 // Keep curVal and hasData completely untouched!
+
                             }
+
                             else
+
                             {
+
                                 curVal = "";
+
                                 curState = "frontend";
+
                                 hasData = false;
+
                                 missingMatchTicks = 0;
+
                             }
+
                         }
+
                     }
-                }
-                catch { }
 
-                Thread.Sleep(250);
-            }
 
-            if (hProc != IntPtr.Zero) CloseHandle(hProc);
-        }
 
-        private bool ScanNativeStreamRange(IntPtr hProc, long startAddr, long endAddr, uint activeUser, ulong steamId64, bool isRendererTarget, byte[] pageBuf, out long foundAddr, out string val, out string state, out bool inGame)
-        {
-            foundAddr = 0; val = ""; state = "none"; inGame = false;
-            byte[] needle = Encoding.ASCII.GetBytes("steam_display");
+}
 
-            long latestMatchAddr = 0;
-            string latestMatchVal = "";
-            string latestMatchState = "profit";
-            ulong maxMatchTs = 0;
 
-            long latestIdleAddr = 0;
-            ulong maxIdleTs = 0;
 
-            long addr = startAddr;
-            while (addr < endAddr && isRunning)
-            {
-                MEMORY_BASIC_INFORMATION mbi;
-                if (VirtualQueryEx(hProc, (IntPtr)addr, out mbi, Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION))) == 0)
-                    break;
+catch { }
 
-                long baseAddr = mbi.BaseAddress.ToInt64();
-                long size = mbi.RegionSize.ToInt64();
-                if (size <= 0) break;
-                if (baseAddr == 0) baseAddr = addr;
 
-                if (mbi.State == 0x1000 && (mbi.Protect == 0x04 || mbi.Protect == 0x02 || mbi.Protect == 0x08))
-                {
-                    long offset = 0;
-                    while (offset < size && isRunning)
-                    {
-                        int toRead = (int)Math.Min((long)pageBuf.Length, size - offset);
-                        IntPtr nRead;
-                        if (ReadProcessMemory(hProc, (IntPtr)(baseAddr + offset), pageBuf, toRead, out nRead))
-                        {
-                            int bytesRead = (int)nRead;
-                            for (int i = 0; i <= bytesRead - needle.Length; i++)
-                            {
-                                if (pageBuf[i] == needle[0] && pageBuf[i + 1] == needle[1] && pageBuf[i + 6] == needle[6] && pageBuf[i + 12] == needle[12])
-                                {
-                                    bool match = true;
-                                    for (int k = 2; k < needle.Length; k++)
-                                    {
-                                        if (pageBuf[i + k] != needle[k]) { match = false; break; }
-                                    }
-                                    if (match)
-                                    {
-                                        // Strict owner verification: Extract owner SteamID64 preceding the packet
-                                        ulong ownerSteamId = ExtractOwnerSteamId(pageBuf, i);
-                                        if (steamId64 != 0 && ownerSteamId != steamId64)
-                                        {
-                                            // Packet belongs to a friend (e.g. Steam chat / friends list) or unknown. Skip!
-                                            continue;
+
+Thread.Sleep(250);
+
+
+
+}
+
+
+
+if (hProc != IntPtr.Zero) CloseHandle(hProc);
+
+
+
+}
+
+
+
+private bool ScanNativeStreamRange(IntPtr hProc, long startAddr, long endAddr, uint activeUser, ulong steamId64, bool isRendererTarget, byte[] pageBuf, out long foundAddr, out string val, out string state, out bool inGame)
+
+
+
+{
+
+
+
+foundAddr = 0; val = ""; state = "none"; inGame = false;
+
+
+
+byte[] needle = Encoding.ASCII.GetBytes("steam_display");
+
+
+
+byte[] userBytes4 = activeUser != 0 ? BitConverter.GetBytes(activeUser) : null;
+
+
+
+byte[] userBytes8 = steamId64 != 0 ? BitConverter.GetBytes(steamId64) : null;
+
+
+
+byte[] localHistTag = new byte[] { 0x7a, 0x04, (byte)'H', (byte)'I', (byte)'S', (byte)'T' };
+
+
+
+long latestMatchAddr = 0;
+
+
+
+string latestMatchVal = "";
+
+
+
+string latestMatchState = "profit";
+
+
+
+ulong maxMatchTs = 0;
+
+
+
+long latestIdleAddr = 0;
+
+
+
+ulong maxIdleTs = 0;
+
+
+
+long addr = startAddr;
+
+
+
+while (addr < endAddr && isRunning)
+
+
+
+{
+
+
+
+MEMORY_BASIC_INFORMATION mbi;
+
+
+
+if (VirtualQueryEx(hProc, (IntPtr)addr, out mbi, Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION))) == 0)
+
+
+
+break;
+
+
+
+long baseAddr = mbi.BaseAddress.ToInt64();
+
+
+
+long size = mbi.RegionSize.ToInt64();
+
+
+
+if (size <= 0) break;
+
+
+
+if (baseAddr == 0) baseAddr = addr;
+
+
+
+if (mbi.State == 0x1000 && (mbi.Protect == 0x04 || mbi.Protect == 0x02 || mbi.Protect == 0x08))
+
+
+
+{
+
+
+
+long offset = 0;
+
+
+
+while (offset < size && isRunning)
+
+
+
+{
+
+
+
+int toRead = (int)Math.Min((long)pageBuf.Length, size - offset);
+
+
+
+IntPtr nRead;
+
+
+
+if (ReadProcessMemory(hProc, (IntPtr)(baseAddr + offset), pageBuf, toRead, out nRead))
+
+
+
+{
+
+
+
+int bytesRead = (int)nRead;
+
+
+
+for (int i = 0; i <= bytesRead - needle.Length; i++)
+
+
+
+{
+
+
+
+if (pageBuf[i] == needle[0] && pageBuf[i + 1] == needle[1] && pageBuf[i + 6] == needle[6] && pageBuf[i + 12] == needle[12])
+
+
+
+{
+
+
+
+bool match = true;
+
+
+
+for (int k = 2; k < needle.Length; k++)
+
+
+
+{
+
+
+
+if (pageBuf[i + k] != needle[k]) { match = false; break; }
+
+
+
+}
+
+
+
+if (match)
+
+
+
+{
+
+
+
+int chunkStart = Math.Max(0, i - 400);
+
+
+
+int chunkLen = Math.Min(bytesRead - chunkStart, 750);
+
+
+
+bool isLocal = false;
+
+
+
+if (userBytes8 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes8) != -1) isLocal = true;
+
+
+
+else if (userBytes4 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes4) != -1) isLocal = true;
+
+
+
+else if (FindBytesSub(pageBuf, chunkStart, chunkLen, localHistTag) != -1) isLocal = true;
+
+
+
+if (isLocal)
+
+
+
+{
+
+
+
+int bodyLen = Math.Min(bytesRead - i, 250);
+
+
+
+string body = Encoding.ASCII.GetString(pageBuf, i, bodyLen);
+
+
+
+Match ms = Regex.Match(body, @"#Status_(\w+)");
+
+
+
+if (ms.Success)
+
+
+
+{
+
+
+
+string st = ms.Groups[1].Value;
+
+
+
+// Extract 8-byte Steam Rich Presence sequence ID from "lobby" header
+
+
+
+ulong ts = 0;
+
+
+
+int lIdx = -1;
+
+
+
+int lStart = Math.Max(0, i - 80);
+
+
+
+for (int j = i - 6; j >= lStart; j--)
+
+
+
+{
+
+
+
+if (pageBuf[j] == 'l' && pageBuf[j + 1] == 'o' && pageBuf[j + 2] == 'b' && pageBuf[j + 3] == 'b' && pageBuf[j + 4] == 'y' && pageBuf[j + 5] == 0)
+
+
+
+{
+
+
+
+lIdx = j;
+
+
+
+break;
+
+
+
+}
+
+
+
+}
+
+
+
+if (lIdx != -1 && lIdx + 14 <= bytesRead)
+
+
+
+{
+
+
+
+ts = BitConverter.ToUInt64(pageBuf, lIdx + 6);
+
+
+
+}
+
+
+
+else
+
+
+
+{
+
+
+
+int tIdx = FindBytesSub(pageBuf, Math.Max(0, i - 120), Math.Min(120, i), new byte[] { 0xf8, 0x02 });
+
+
+
+if (tIdx != -1) ts = DecodeVarint(pageBuf, tIdx + 2);
+
+
+
+else
+
+
+
+{
+
+
+
+tIdx = FindBytesSub(pageBuf, Math.Max(0, i - 120), Math.Min(120, i), new byte[] { 0xe8, 0x02 });
+
+
+
+if (tIdx != -1) ts = DecodeVarint(pageBuf, tIdx + 2);
+
+
+
+}
+
+
+
+}
+
+
+
+if (st == "KOTH" && !body.Contains("unknown") && !body.Contains("match_lost"))
+
+
+
+{
+
+
+
+Match mp = Regex.Match(body, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
+
+
+
+Match mg = Regex.Match(body, @"game_state[^\w]*(\w+)");
+
+
+
+if (mp.Success && mg.Success && (mg.Groups[1].Value == "playing" || mg.Groups[1].Value == "pre_match"))
+
+
+
+{
+
+
+
+string pVal = mp.Groups[1].Value.Replace(" ", "");
+
+
+
+string pState;
+
+
+
+Match mst = Regex.Match(body, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+
+
+
+if (mst.Success) pState = mst.Groups[1].Value.ToLowerInvariant();
+
+
+
+else pState = pVal.Contains("-") ? "loss" : "profit";
+
+
+
+bool isNewerMatch = (ts > maxMatchTs) || (ts == maxMatchTs && (baseAddr + offset + i) > latestMatchAddr);
+
+
+
+if (isNewerMatch)
+
+
+
+{
+
+
+
+maxMatchTs = ts;
+
+
+
+latestMatchAddr = baseAddr + offset + i;
+
+
+
+latestMatchVal = pVal;
+
+
+
+latestMatchState = pState;
+
+
+
+}
+
+
+
+}
+
+
+
+}
+
+
+
+else if (st == "Frontend" || st == "ShootingRange")
+
+                                                {
+
+                                                    bool isNewerIdle = (ts > maxIdleTs) || (ts == maxIdleTs && (baseAddr + offset + i) > latestIdleAddr);
+
+                                                    if (isNewerIdle)
+
+                                                    {
+
+                                                        maxIdleTs = ts;
+
+                                                        latestIdleAddr = baseAddr + offset + i;
+
+                                                    }
+
+                                                }
+
+                                            }
+
                                         }
 
-                                        int bodyLen = Math.Min(bytesRead - i, 250);
-                                        string body = Encoding.ASCII.GetString(pageBuf, i, bodyLen);
-                                        Match ms = Regex.Match(body, @"#Status_(\w+)");
-                                        if (ms.Success)
-                                        {
-                                            string st = ms.Groups[1].Value;
-
-                                            // Extract 8-byte Steam Rich Presence sequence ID from lobby header
-                                            ulong ts = 0;
-                                            int lIdx = -1;
-                                            int lStart = Math.Max(0, i - 80);
-                                            for (int j = i - 6; j >= lStart; j--)
-                                            {
-                                                if (pageBuf[j] == 'l' && pageBuf[j + 1] == 'o' && pageBuf[j + 2] == 'b' && pageBuf[j + 3] == 'b' && pageBuf[j + 4] == 'y' && pageBuf[j + 5] == 0)
-                                                {
-                                                    lIdx = j;
-                                                    break;
-                                                }
-                                            }
-                                            if (lIdx != -1 && lIdx + 14 <= bytesRead)
-                                            {
-                                                ts = BitConverter.ToUInt64(pageBuf, lIdx + 6);
-                                            }
-                                            else
-                                            {
-                                                int tIdx = FindBytesSub(pageBuf, Math.Max(0, i - 120), Math.Min(120, i), new byte[] { 0xf8, 0x02 });
-                                                if (tIdx != -1) ts = DecodeVarint(pageBuf, tIdx + 2);
-                                                else
-                                                {
-                                                    tIdx = FindBytesSub(pageBuf, Math.Max(0, i - 120), Math.Min(120, i), new byte[] { 0xe8, 0x02 });
-                                                    if (tIdx != -1) ts = DecodeVarint(pageBuf, tIdx + 2);
-                                                }
-                                            }
-
-                                            // If packet contains profit_loss, it is unconditionally an in-match packet!
-                                            Match mp = Regex.Match(body, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
-                                            if (mp.Success && !body.Contains("match_lost"))
-                                            {
-                                                string pVal = mp.Groups[1].Value.Replace(" ", "");
-                                                string pState;
-                                                Match mst = Regex.Match(body, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                                if (mst.Success) pState = mst.Groups[1].Value.ToLowerInvariant();
-                                                else pState = pVal.Contains("-") ? "loss" : "profit";
-
-                                                bool isNewerMatch = (ts > maxMatchTs) || (ts == maxMatchTs && (baseAddr + offset + i) > latestMatchAddr);
-                                                if (isNewerMatch)
-                                                {
-                                                    maxMatchTs = ts;
-                                                    latestMatchAddr = baseAddr + offset + i;
-                                                    latestMatchVal = pVal;
-                                                    latestMatchState = pState;
-                                                }
-                                            }
-                                            else if (st == "Frontend" || st == "ShootingRange")
-                                            {
-                                                bool isNewerIdle = (ts > maxIdleTs) || (ts == maxIdleTs && (baseAddr + offset + i) > latestIdleAddr);
-                                                if (isNewerIdle)
-                                                {
-                                                    maxIdleTs = ts;
-                                                    latestIdleAddr = baseAddr + offset + i;
-                                                }
-                                            }
-                                        }
                                     }
+
                                 }
+
                             }
+
                         }
+
                         offset += toRead;
-                    }
-                }
 
-                long nextAddr = baseAddr + size;
-                if (nextAddr <= addr) break;
-                addr = nextAddr;
-            }
 
-            // If a valid profit_loss match packet was found for our SteamID, it ALWAYS takes priority over stale lobby remnants!
-            if (latestMatchAddr > 0 && !string.IsNullOrEmpty(latestMatchVal))
-            {
-                foundAddr = latestMatchAddr;
-                val = latestMatchVal;
-                state = latestMatchState;
-                inGame = true;
-                return true;
-            }
 
-            if (latestIdleAddr > 0)
-            {
-                foundAddr = latestIdleAddr;
-                val = "";
-                state = "frontend";
-                inGame = false;
-                return true;
-            }
+}
 
-            return false;
-        }
+
+
+}
+
+
+
+long nextAddr = baseAddr + size;
+
+
+
+if (nextAddr <= addr) break;
+
+
+
+addr = nextAddr;
+
+
+
+}
+
+
+
+bool matchIsNewer = false;
+
+
+
+if (latestMatchAddr > 0 && !string.IsNullOrEmpty(latestMatchVal))
+
+
+
+{
+
+
+
+if (maxMatchTs > 0 || maxIdleTs > 0)
+
+
+
+{
+
+
+
+matchIsNewer = (maxMatchTs > maxIdleTs) || (maxMatchTs == maxIdleTs && latestMatchAddr >= latestIdleAddr);
+
+
+
+}
+
+
+
+else
+
+
+
+{
+
+
+
+matchIsNewer = latestIdleAddr == 0 || latestMatchAddr >= latestIdleAddr;
+
+
+
+}
+
+
+
+}
+
+
+
+if (matchIsNewer && latestMatchAddr > 0 && !string.IsNullOrEmpty(latestMatchVal))
+
+
+
+{
+
+
+
+foundAddr = latestMatchAddr;
+
+
+
+val = latestMatchVal;
+
+
+
+state = latestMatchState;
+
+
+
+inGame = true;
+
+
+
+return true;
+
+
+
+}
+
+
+
+if (latestIdleAddr > 0)
+
+
+
+{
+
+
+
+foundAddr = latestIdleAddr;
+
+
+
+val = "";
+
+
+
+state = "frontend";
+
+
+
+inGame = false;
+
+
+
+return true;
+
+
+
+}
+
+
+
+return false;
+
+
+
+}
+
 
 
 private static ulong DecodeVarint(byte[] data, int pos)
