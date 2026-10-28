@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 
 
 
@@ -222,866 +222,366 @@ File.WriteAllText(Path.Combine(Environment.GetFolderPath(Environment.SpecialFold
 
 
 
-public class SteamDirectProfitReader : IDisposable
 
 
 
+// =========================================================================
+// SteamWebProfitReader: Edge 내장 브라우저 자동 연동 (최종 완결판)
+// =========================================================================
+public class SteamWebProfitReader : IDisposable
 {
-
-
-
-[DllImport("kernel32.dll", SetLastError = true)]
-
-
-
-private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
-
-
-
-[DllImport("kernel32.dll", SetLastError = true)]
-
-
-
-private static extern bool CloseHandle(IntPtr hObject);
-
-
-
-[DllImport("kernel32.dll", SetLastError = true)]
-
-
-
-private static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, [Out] byte[] lpBuffer, int dwSize, out IntPtr lpNumberOfBytesRead);
-
-
-
-[DllImport("kernel32.dll", SetLastError = true)]
-
-
-
-private static extern int VirtualQueryEx(IntPtr hProcess, IntPtr lpAddress, out MEMORY_BASIC_INFORMATION lpBuffer, int dwLength);
-
-
-
-[StructLayout(LayoutKind.Sequential)]
-
-
-
-private struct MEMORY_BASIC_INFORMATION
-
-
-
-{
-
-
-
-public IntPtr BaseAddress;
-
-
-
-public IntPtr AllocationBase;
-
-
-
-public uint AllocationProtect;
-
-
-
-public ushort PartitionId;
-
-
-
-public IntPtr RegionSize;
-
-
-
-public uint State;
-
-
-
-public uint Protect;
-
-
-
-public uint Type;
-
-
-
-}
-
-
-
-private const uint PROCESS_VM_READ = 0x0010;
-
-
-
-private const uint PROCESS_QUERY_INFORMATION = 0x0400;
-
-
-
-private readonly object syncLock = new object();
-
-
-
-private Thread bgWorker;
-
-
-
-private volatile bool isRunning = true;
-
-
-
-private string curVal = "";
-
-
-
-private string curState = "";
-
-
-
-private string curFaction = "";
-
-
-
-private string curGame = "";
-
-
-
-private ulong curTs = 0;
-
-
-
-private bool hasData = false;
-
-
-
-public bool IsSteamRunning { get; private set; }
-
-
-
-public bool IsWardogsRunning { get; private set; }
-
-
-
-public SteamDirectProfitReader()
-
-
-
-{
-
-
-
-bgWorker = new Thread(WorkerLoop)
-
-
-
-{
-
-
-
-IsBackground = true,
-
-
-
-Name = "SteamProfitReaderWorker"
-
-
-
-};
-
-
-
-bgWorker.Start();
-
-
-
-}
-
-
-
-public bool Poll(out string profitLossStr, out string stateStr, out string factionStr, out string gameStateStr, out ulong timestamp)
-
-
-
-{
-
-
-
-lock (syncLock)
-
-
-
-{
-
-
-
-profitLossStr = curVal;
-
-
-
-stateStr = curState;
-
-
-
-factionStr = curFaction;
-
-
-
-gameStateStr = curGame;
-
-
-
-timestamp = curTs;
-
-
-
-return hasData;
-
-
-
-}
-
-
-
-}
-
-
-
-private static Process FindTargetRenderer()
-
-
-
-{
-
-
-
-Process[] helpers = Process.GetProcessesByName("steamwebhelper");
-
-
-
-if (helpers == null || helpers.Length == 0) return null;
-
-
-
-Process best = null;
-
-
-
-long maxWs = 0;
-
-
-
-foreach (Process p in helpers)
-
-
-
-{
-
-
-
-try
-
-
-
-{
-
-
-
-if (p.WorkingSet64 > maxWs)
-
-
-
-{
-
-
-
-maxWs = p.WorkingSet64;
-
-
-
-best = p;
-
-
-
-}
-
-
-
-}
-
-
-
-catch { }
-
-
-
-}
-
-
-
-return best;
-
-
-
-}
-
-
-
-private void CheckProcesses(out int steamPid, out uint activeUser, ref ulong steamId64)
-
-
-
-{
-
-
-
-steamPid = 0;
-
-
-
-activeUser = 0;
-
-
-
-try
-
-
-
-{
-
-
-
-using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam\ActiveProcess"))
-
-
-
-{
-
-
-
-if (key != null)
-
-
-
-{
-
-
-
-steamPid = Convert.ToInt32(key.GetValue("pid", 0));
-
-
-
-activeUser = Convert.ToUInt32(key.GetValue("ActiveUser", 0));
-
-
-
-if (activeUser != 0) steamId64 = 76561197960265728UL + activeUser;
-
-
-
-}
-
-
-
-}
-
-
-
-}
-
-
-
-catch { }
-
-
-
-IsSteamRunning = steamPid != 0 && (Process.GetProcessesByName("steam").Length > 0 || Process.GetProcessesByName("steamwebhelper").Length > 0);
-
-
-
-IsWardogsRunning = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Length > 0;
-
-
-
-}
-
-
-
-                private void WorkerLoop()
+    private System.Net.HttpListener _listener;
+    private System.Threading.Thread _listenThread;
+    private System.Threading.Thread _watchdogThread;
+    private volatile bool _running;
+    private readonly object _lock = new object();
+
+    private string _curVal = "";
+    private string _curState = "frontend";
+    private string _curFaction = "";
+    private DateTime _lastReceived = DateTime.MinValue;
+    private int _primaryPort = 27060;
+    private int _relayPort = 0;
+
+    private static System.Diagnostics.Process _edgeProcess = null;
+
+    public static string ProfileDir
+    {
+        get
         {
-            int steamPid = 0;
-            ulong steamId64 = 0UL;
-            IntPtr hProc = IntPtr.Zero;
-            int currentPid = 0;
-            long cachedAddr = 0;
-            int pollTick = 0;
-            int missingMatchTicks = 0;
-            int lobbyConfirmTicks = 0;
-            byte[] pageBuf = new byte[65536];
-
-            while (isRunning)
+            string localApp = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string dir = System.IO.Path.Combine(localApp, "WardogsSteamProfile");
+            if (!System.IO.Directory.Exists(dir))
             {
-                try
-                {
-                    uint activeUser;
-                    CheckProcesses(out steamPid, out activeUser, ref steamId64);
-                    if (!IsSteamRunning || !IsWardogsRunning)
-                    {
-                        if (!IsSteamRunning && hProc != IntPtr.Zero) { CloseHandle(hProc); hProc = IntPtr.Zero; currentPid = 0; }
-                        cachedAddr = 0;
-                        lock (syncLock) { hasData = false; curVal = ""; curState = "frontend"; }
-                        Thread.Sleep(1000);
-                        continue;
-                    }
-
-                    int targetPid = steamPid;
-                    if (targetPid == 0)
-                    {
-                        Process[] sps = Process.GetProcessesByName("steam");
-                        if (sps != null && sps.Length > 0 && !sps[0].HasExited) targetPid = sps[0].Id;
-                    }
-
-                    if (targetPid == 0)
-                    {
-                        Thread.Sleep(500);
-                        continue;
-                    }
-
-                    if (targetPid != currentPid || hProc == IntPtr.Zero)
-                    {
-                        if (hProc != IntPtr.Zero) CloseHandle(hProc);
-                        currentPid = targetPid;
-                        hProc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, currentPid);
-                        cachedAddr = 0;
-                    }
-                    if (hProc == IntPtr.Zero)
-                    {
-                        Thread.Sleep(500);
-                        continue;
-                    }
-
-                    string val = "", state = "";
-                    long foundAddr = 0;
-                    bool inGame = false;
-                    bool ok = false;
-
-                    // Periodic re-scan every 10 seconds (40 ticks) to refresh pointer
-                    if (++pollTick % 40 == 0)
-                    {
-                        cachedAddr = 0;
-                    }
-
-                    // 1. Cached fast in-place read (direct memory read)
-                    if (cachedAddr > 0)
-                    {
-                        IntPtr nRead;
-                        if (ReadProcessMemory(hProc, (IntPtr)cachedAddr, pageBuf, 256, out nRead) && (int)nRead >= 64)
-                        {
-                            if (pageBuf[0] == 'R' && pageBuf[1] == 'P' && pageBuf[2] == 0 && pageBuf[3] == 1)
-                            {
-                                int rCount = (int)nRead;
-                                bool isFriend = false;
-                                bool hasCleanEOD = false;
-                                for (int k = 0; k <= rCount - 5; k++)
-                                {
-                                    if (pageBuf[k] == 0x08 && pageBuf[k + 1] == 0x08)
-                                    {
-                                        if (pageBuf[k + 2] == 0x11) { isFriend = true; break; }
-                                        if (pageBuf[k + 2] == 0x00 && pageBuf[k + 3] == 0x08 && pageBuf[k + 4] == 0x08)
-                                        {
-                                            hasCleanEOD = true;
-                                        }
-                                    }
-                                }
-
-                                if (!isFriend && hasCleanEOD)
-                                {
-                                    string body = Encoding.ASCII.GetString(pageBuf, 0, rCount);
-                                    Match mp = Regex.Match(body, "profit_loss\0([^\0]+)");
-                                    Match mst = Regex.Match(body, "in_profit_or_loss\0([^\0]+)");
-                                    Match mg = Regex.Match(body, "game_state\0([^\0]+)");
-                                    string gameState = mg.Success ? mg.Groups[1].Value.ToLowerInvariant() : "";
-
-                                    if (mp.Success && gameState != "pre_match" && !body.Contains("#Status_Frontend") && !body.Contains("#Status_ShootingRange"))
-                                    {
-                                        val = mp.Groups[1].Value.Replace(" ", "");
-                                        if (mst.Success) state = mst.Groups[1].Value.ToLowerInvariant();
-                                        else state = val.Contains("-") ? "loss" : "profit";
-                                        inGame = true;
-                                        ok = true;
-                                    }
-                                    else if (body.Contains("#Status_Frontend") || body.Contains("#Status_ShootingRange") || gameState == "pre_match")
-                                    {
-                                        state = body.Contains("#Status_ShootingRange") ? "shootingrange" : "frontend";
-                                        inGame = false;
-                                        val = "";
-                                        ok = true;
-                                    }
-                                }
-                                else
-                                {
-                                    cachedAddr = 0;
-                                }
-                            }
-                            else
-                            {
-                                cachedAddr = 0;
-                            }
-                        }
-                        else
-                        {
-                            cachedAddr = 0;
-                        }
-                    }
-
-                    // 2. Full scan for local player Rich Presence in steam.exe
-                    if (!ok)
-                    {
-                        ok = ScanLocalRichPresence(hProc, pageBuf, out foundAddr, out val, out state, out inGame);
-                        if (ok && foundAddr > 0 && inGame)
-                        {
-                            cachedAddr = foundAddr;
-                        }
-                        else
-                        {
-                            cachedAddr = 0;
-                        }
-                    }
-
-                    lock (syncLock)
-                    {
-                        if (inGame && !string.IsNullOrEmpty(val))
-                        {
-                            curVal = val;
-                            curState = state;
-                            hasData = true;
-                            missingMatchTicks = 0;
-                            lobbyConfirmTicks = 0;
-                        }
-                        else if (ok && (state == "frontend" || state == "shootingrange"))
-                        {
-                            if (hasData && IsWardogsRunning)
-                            {
-                                if (++lobbyConfirmTicks <= 10)
-                                {
-                                    // Hold previous profit value firmly
-                                }
-                                else
-                                {
-                                    curVal = "";
-                                    curState = state;
-                                    hasData = false;
-                                    missingMatchTicks = 0;
-                                    lobbyConfirmTicks = 0;
-                                }
-                            }
-                            else
-                            {
-                                curVal = "";
-                                curState = state;
-                                hasData = false;
-                                missingMatchTicks = 0;
-                                lobbyConfirmTicks = 0;
-                            }
-                        }
-                        else
-                        {
-                            lobbyConfirmTicks = 0;
-                            if (hasData && IsWardogsRunning && ++missingMatchTicks <= 20)
-                            {
-                                // Keep curVal untouched
-                            }
-                            else
-                            {
-                                curVal = "";
-                                curState = "frontend";
-                                hasData = false;
-                                missingMatchTicks = 0;
-                            }
-                        }
-                    }
-                }
-                catch { }
-
-                Thread.Sleep(250);
+                System.IO.Directory.CreateDirectory(dir);
             }
-
-            if (hProc != IntPtr.Zero) CloseHandle(hProc);
+            return dir;
         }
+    }
 
-        private bool ScanLocalRichPresence(IntPtr hProc, byte[] pageBuf, out long foundAddr, out string val, out string state, out bool inGame)
+    public static string ExtensionDir
+    {
+        get
         {
-            foundAddr = 0; val = ""; state = "none"; inGame = false;
-            byte[] needle = new byte[] { (byte)'R', (byte)'P', 0, 1, (byte)'s', (byte)'t', (byte)'e', (byte)'a', (byte)'m', (byte)'_', (byte)'d', (byte)'i', (byte)'s', (byte)'p', (byte)'l', (byte)'a', (byte)'y', 0 };
-
-            int bestScore = -1;
-            long bestFoundAddr = 0;
-            string bestVal = "";
-            string bestState = "";
-            bool bestInGame = false;
-
-            long addr = 0;
-            while (addr < 0x7FFFFFFFFFFF && isRunning)
+            string ext = System.IO.Path.Combine(ProfileDir, "AutoSyncExtension");
+            if (!System.IO.Directory.Exists(ext))
             {
-                MEMORY_BASIC_INFORMATION mbi;
-                if (VirtualQueryEx(hProc, (IntPtr)addr, out mbi, Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION))) == 0)
-                    break;
+                System.IO.Directory.CreateDirectory(ext);
+            }
+            return ext;
+        }
+    }
 
-                long baseAddr = mbi.BaseAddress.ToInt64();
-                long size = mbi.RegionSize.ToInt64();
-                if (size <= 0) break;
-                if (baseAddr == 0) baseAddr = addr;
+    public static string FindEdgeExe()
+    {
+        string p1 = @"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe";
+        if (System.IO.File.Exists(p1)) return p1;
+        string p2 = @"C:\Program Files\Microsoft\Edge\Application\msedge.exe";
+        if (System.IO.File.Exists(p2)) return p2;
+        return "msedge.exe";
+    }
 
-                if (mbi.State == 0x1000 && (mbi.Protect == 0x04 || mbi.Protect == 0x02 || mbi.Protect == 0x08))
+    public static void EnsureExtensionFiles()
+    {
+        try
+        {
+            string ext = ExtensionDir;
+            string manifestPath = System.IO.Path.Combine(ext, "manifest.json");
+            string contentPath = System.IO.Path.Combine(ext, "content.js");
+
+            string manifestJson = "{\n" +
+                "  \"manifest_version\": 3,\n" +
+                "  \"name\": \"WARDOGS Auto Sync\",\n" +
+                "  \"version\": \"1.0\",\n" +
+                "  \"content_scripts\": [{\n" +
+                "    \"matches\": [\"https://steamcommunity.com/chat*\"],\n" +
+                "    \"js\": [\"content.js\"],\n" +
+                "    \"run_at\": \"document_idle\"\n" +
+                "  }]\n" +
+                "}";
+
+            string contentJs = "(function() {\n" +
+                "  const S = \"#friendslist-container > div > div.chat_main_flex.displayRow.Panel.Focusable > div.DropTarget.friendsListContainer.fullheight.Panel.Focusable > div > div.friendListHeaderContainer.titleBarContainer > div.currentUserContainer.ingame > div > div.labelHolder.ingame > div._9lhfreYH7b4- > div:nth-child(2)\";\n" +
+                "  function sync() {\n" +
+                "    let el = document.querySelector(S);\n" +
+                "    let txt = '';\n" +
+                "    if (el && el.innerText) { txt = el.innerText; }\n" +
+                "    else {\n" +
+                "      const box = document.querySelector('.currentUserContainer.ingame') || document.querySelector('.currentUserContainer');\n" +
+                "      if (box) {\n" +
+                "        const divs = box.querySelectorAll('div, span');\n" +
+                "        for (let i = 0; i < divs.length; i++) {\n" +
+                "          const t = (divs[i].innerText || '').trim();\n" +
+                "          if (/^[+-]?\\s*\\$?[\\d,]+/.test(t)) { txt = t; break; }\n" +
+                "        }\n" +
+                "      }\n" +
+                "    }\n" +
+                "    if (!txt) return;\n" +
+                "    const m = txt.match(/[+-]?\\s*\\$?[\\d,]+/);\n" +
+                "    if (m) {\n" +
+                "      const clean = m[0].replace(/\\s+/g, '');\n" +
+                "      fetch('http://127.0.0.1:27060/profit/?val=' + encodeURIComponent(clean), { mode: 'no-cors' }).catch(()=>{});\n" +
+                "    }\n" +
+                "  }\n" +
+                "  setInterval(sync, 1000);\n" +
+                "})();";
+
+            System.IO.File.WriteAllText(manifestPath, manifestJson, System.Text.Encoding.UTF8);
+            System.IO.File.WriteAllText(contentPath, contentJs, System.Text.Encoding.UTF8);
+        }
+        catch { }
+    }
+
+    public static void LaunchEdgeApp(bool showNormalWindow)
+    {
+        try
+        {
+            EnsureExtensionFiles();
+            string edge = FindEdgeExe();
+            string profile = ProfileDir;
+            string ext = ExtensionDir;
+
+            string args = string.Format(
+                "--user-data-dir=\"{0}\" --load-extension=\"{1}\" --no-first-run --no-default-browser-check --app=https://steamcommunity.com/chat",
+                profile, ext
+            );
+
+            var psi = new System.Diagnostics.ProcessStartInfo(edge, args);
+            psi.WindowStyle = showNormalWindow ? System.Diagnostics.ProcessWindowStyle.Normal : System.Diagnostics.ProcessWindowStyle.Minimized;
+
+            _edgeProcess = System.Diagnostics.Process.Start(psi);
+        }
+        catch { }
+    }
+
+    public static void ResetSteamLogin()
+    {
+        try
+        {
+            if (_edgeProcess != null && !_edgeProcess.HasExited)
+            {
+                try { _edgeProcess.Kill(); } catch { }
+            }
+
+            string profile = ProfileDir;
+            string defaultDir = System.IO.Path.Combine(profile, "Default");
+            if (System.IO.Directory.Exists(defaultDir))
+            {
+                try { System.IO.Directory.Delete(defaultDir, true); } catch { }
+            }
+
+            System.Windows.Forms.MessageBox.Show("기존 스팀 로그인 정보가 초기화되었습니다.\n새로운 아이디로 로그인해 주세요.", "계정 변경");
+            LaunchEdgeApp(true);
+        }
+        catch (Exception ex)
+        {
+            System.Windows.Forms.MessageBox.Show("초기화 오류: " + ex.Message, "오류");
+        }
+    }
+
+    public bool IsWardogsRunning
+    {
+        get
+        {
+            try
+            {
+                var procs = System.Diagnostics.Process.GetProcessesByName("WardogsClient-Win64-Shipping");
+                return procs != null && procs.Length > 0;
+            }
+            catch { return true; }
+        }
+    }
+
+    public SteamWebProfitReader(int primaryPort, int relayPort = 0)
+    {
+        _primaryPort = primaryPort;
+        _relayPort = relayPort;
+        StartListener();
+
+        System.Threading.ThreadPool.QueueUserWorkItem((_) =>
+        {
+            System.Threading.Thread.Sleep(1500);
+            LaunchEdgeApp(false);
+        });
+
+        _watchdogThread = new System.Threading.Thread(WatchdogLoop);
+        _watchdogThread.IsBackground = true;
+        _watchdogThread.Name = "EdgeKeepAliveWatchdog";
+        _watchdogThread.Start();
+    }
+
+    private void WatchdogLoop()
+    {
+        while (_running)
+        {
+            System.Threading.Thread.Sleep(5000);
+            if (!_running) break;
+
+            if ((DateTime.Now - _lastReceived).TotalSeconds > 15)
+            {
+                if (_edgeProcess == null || _edgeProcess.HasExited)
                 {
-                    long offset = 0;
-                    while (offset < size && isRunning)
+                    LaunchEdgeApp(false);
+                }
+            }
+        }
+    }
+
+    private void StartListener()
+    {
+        int[] portsToTry;
+        if (_primaryPort == 27060)
+            portsToTry = new int[] { 27060, 49512, 49513 };
+        else
+            portsToTry = new int[] { _primaryPort, 27060, 49513, 49512 };
+
+        foreach (int p in portsToTry)
+        {
+            try
+            {
+                var l = new System.Net.HttpListener();
+                l.Prefixes.Add(string.Format("http://127.0.0.1:{0}/profit/", p));
+                l.Start();
+                _listener = l;
+                _running = true;
+                _listenThread = new System.Threading.Thread(ListenLoop);
+                _listenThread.IsBackground = true;
+                _listenThread.Name = "SteamWebProfitReader_" + p;
+                _listenThread.Start();
+                break;
+            }
+            catch { }
+        }
+    }
+
+    private void ListenLoop()
+    {
+        while (_running && _listener != null && _listener.IsListening)
+        {
+            try
+            {
+                var context = _listener.GetContext();
+                System.Threading.ThreadPool.QueueUserWorkItem(ProcessRequest, context);
+            }
+            catch
+            {
+                if (!_running) break;
+            }
+        }
+    }
+
+    private void ProcessRequest(object state)
+    {
+        try
+        {
+            var context = (System.Net.HttpListenerContext)state;
+            var req = context.Request;
+            var resp = context.Response;
+
+            resp.Headers.Add("Access-Control-Allow-Origin", "*");
+            resp.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            resp.Headers.Add("Access-Control-Allow-Headers", "*");
+            resp.Headers.Add("Access-Control-Allow-Private-Network", "true");
+
+            if (req.HttpMethod == "OPTIONS")
+            {
+                resp.StatusCode = 200;
+                resp.Close();
+                return;
+            }
+
+            string val = req.QueryString["val"];
+            if (!string.IsNullOrEmpty(val))
+            {
+                val = val.Trim();
+                val = val.Replace("수익", "").Replace("손실", "").Trim();
+                var m = System.Text.RegularExpressions.Regex.Match(val, @"[+-]?\s*\$?[\d,]+");
+                if (m.Success)
+                {
+                    val = m.Value.Replace(" ", "");
+                }
+
+                lock (_lock)
+                {
+                    _curVal = val;
+                    _lastReceived = DateTime.Now;
+
+                    if (val.Contains("-"))
                     {
-                        int toRead = (int)Math.Min((long)pageBuf.Length, size - offset);
-                        IntPtr nRead;
-                        if (ReadProcessMemory(hProc, (IntPtr)(baseAddr + offset), pageBuf, toRead, out nRead))
-                        {
-                            int bytesRead = (int)nRead;
-                            for (int i = 0; i <= bytesRead - needle.Length; i++)
-                            {
-                                if (pageBuf[i] == needle[0] && pageBuf[i + 1] == needle[1] && pageBuf[i + 3] == needle[3] && pageBuf[i + 4] == needle[4])
-                                {
-                                    bool match = true;
-                                    for (int k = 0; k < needle.Length; k++)
-                                    {
-                                        if (pageBuf[i + k] != needle[k]) { match = false; break; }
-                                    }
-                                    if (match)
-                                    {
-                                        int bodyLen = Math.Min(bytesRead - i, 250);
-                                        // Friend packets have \x08\x08\x11 followed by 8-byte SteamID
-                                        bool isFriend = false;
-                                        bool hasCleanEOD = false;
-                                        for (int j = i; j <= i + bodyLen - 5; j++)
-                                        {
-                                            if (pageBuf[j] == 0x08 && pageBuf[j + 1] == 0x08)
-                                            {
-                                                if (pageBuf[j + 2] == 0x11)
-                                                {
-                                                    isFriend = true;
-                                                    break;
-                                                }
-                                                if (pageBuf[j + 2] == 0x00 && pageBuf[j + 3] == 0x08 && pageBuf[j + 4] == 0x08)
-                                                {
-                                                    hasCleanEOD = true;
-                                                }
-                                            }
-                                        }
-                                        if (isFriend) continue;
-
-                                        int score = 0;
-                                        if (hasCleanEOD) score += 500;
-                                        long offsetInRegion = offset + i;
-                                        if (offsetInRegion <= 16) score += 300;
-                                        else if (offsetInRegion <= 64) score += 100;
-
-                                        string body = Encoding.ASCII.GetString(pageBuf, i, bodyLen);
-                                        Match mp = Regex.Match(body, "profit_loss\\0([^\\0]+)");
-                                        Match mg = Regex.Match(body, "game_state\\0([^\\0]+)");
-                                        string gameState = mg.Success ? mg.Groups[1].Value.ToLowerInvariant() : "";
-
-                                        if (mp.Success && gameState != "pre_match" && !body.Contains("#Status_Frontend") && !body.Contains("#Status_ShootingRange"))
-                                        {
-                                            score += 50;
-                                            if (score > bestScore)
-                                            {
-                                                bestScore = score;
-                                                bestFoundAddr = baseAddr + offset + i;
-                                                bestVal = mp.Groups[1].Value.Replace(" ", "");
-                                                Match mst = Regex.Match(body, "in_profit_or_loss\\0([^\\0]+)");
-                                                if (mst.Success) bestState = mst.Groups[1].Value.ToLowerInvariant();
-                                                else bestState = bestVal.Contains("-") ? "loss" : "profit";
-                                                bestInGame = true;
-                                            }
-                                        }
-                                        else if (body.Contains("#Status_Frontend") || body.Contains("#Status_ShootingRange") || gameState == "pre_match")
-                                        {
-                                            if (score > bestScore)
-                                            {
-                                                bestScore = score;
-                                                bestFoundAddr = baseAddr + offset + i;
-                                                bestState = body.Contains("#Status_ShootingRange") ? "shootingrange" : "frontend";
-                                                bestInGame = false;
-                                                bestVal = "";
-                                            }
-                                        }
-
-                                        // Optimal early termination: true active local KeyValues buffer has score >= 800
-                                        if (bestScore >= 800)
-                                        {
-                                            foundAddr = bestFoundAddr;
-                                            val = bestVal;
-                                            state = bestState;
-                                            inGame = bestInGame;
-                                            return true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        offset += toRead;
+                        _curState = "loss";
+                    }
+                    else if (val == "$0" || val == "0" || val == "+$0")
+                    {
+                        _curState = "frontend";
+                    }
+                    else
+                    {
+                        _curState = "profit";
                     }
                 }
 
-                long nextAddr = baseAddr + size;
-                if (nextAddr <= addr) break;
-                addr = nextAddr;
+                if (_relayPort > 0)
+                {
+                    int rPort = _relayPort;
+                    string relayVal = val;
+                    System.Threading.ThreadPool.QueueUserWorkItem((_) =>
+                    {
+                        try
+                        {
+                            var rReq = System.Net.WebRequest.Create(string.Format("http://127.0.0.1:{0}/profit/?val={1}", rPort, System.Uri.EscapeDataString(relayVal)));
+                            rReq.Timeout = 500;
+                            using (var rResp = rReq.GetResponse()) { }
+                        }
+                        catch { }
+                    });
+                }
             }
 
-            if (bestScore >= 300)
+            byte[] buf = System.Text.Encoding.UTF8.GetBytes("OK");
+            resp.ContentType = "text/plain";
+            resp.ContentLength64 = buf.Length;
+            resp.OutputStream.Write(buf, 0, buf.Length);
+            resp.OutputStream.Close();
+        }
+        catch { }
+    }
+
+    public bool Poll(out string profitLossStr, out string stateStr, out string factionStr, out string gameStateStr, out ulong timestamp)
+    {
+        lock (_lock)
+        {
+            timestamp = (ulong)DateTime.UtcNow.Ticks;
+            factionStr = _curFaction;
+            gameStateStr = "playing";
+
+            if ((DateTime.Now - _lastReceived).TotalSeconds <= 12 && !string.IsNullOrEmpty(_curVal))
             {
-                foundAddr = bestFoundAddr;
-                val = bestVal;
-                state = bestState;
-                inGame = bestInGame;
+                profitLossStr = _curVal;
+                stateStr = _curState;
                 return true;
             }
-
-            return false;
+            else
+            {
+                profitLossStr = "스팀 로그인 필요";
+                stateStr = "frontend";
+                return false;
+            }
         }
+    }
 
-        private static ulong DecodeVarint(byte[] data, int pos)
-
-
-
-{
-
-
-
-ulong val = 0;
-
-
-
-int shift = 0;
-
-
-
-while (pos < data.Length)
-
-
-
-{
-
-
-
-byte b = data[pos++];
-
-
-
-val |= ((ulong)(b & 0x7f)) << shift;
-
-
-
-if ((b & 0x80) == 0) break;
-
-
-
-shift += 7;
-
-
-
-if (shift >= 64) break;
-
-
-
+    public void Dispose()
+    {
+        _running = false;
+        if (_listener != null)
+        {
+            try { _listener.Stop(); _listener.Close(); } catch { }
+        }
+        if (_edgeProcess != null && !_edgeProcess.HasExited)
+        {
+            try { _edgeProcess.Kill(); } catch { }
+        }
+    }
 }
-
-
-
-return val;
-
-
-
-}
-
-
-
-private static int FindBytesSub(byte[] src, int startIdx, int count, byte[] pattern)
-
-
-
-{
-
-
-
-if (pattern == null || pattern.Length == 0) return -1;
-
-
-
-int max = startIdx + count - pattern.Length;
-
-
-
-for (int i = startIdx; i <= max; i++)
-
-
-
-{
-
-
-
-bool match = true;
-
-
-
-for (int j = 0; j < pattern.Length; j++)
-
-
-
-{
-
-
-
-if (src[i + j] != pattern[j]) { match = false; break; }
-
-
-
-}
-
-
-
-if (match) return i;
-
-
-
-}
-
-
-
-return -1;
-
-
-
-}
-
-
-
-public void Dispose()
-
-
-
-{
-
-
-
-isRunning = false;
-
-
-
-try { bgWorker.Abort(); } catch { }
-
-
-
-}
-
-
-
-}
-
 
 
 public class MainHudControlForm : Form
@@ -1120,7 +620,7 @@ private const string RegistryKeyPath = @"Software\WardogsProfitHud";
 
 
 
-private SteamDirectProfitReader steamReader;
+private SteamWebProfitReader steamReader;
 
 
 
@@ -1252,7 +752,7 @@ this.MaximizeBox = false;
 
 
 
-this.ClientSize = new Size(320, 236);
+this.ClientSize = new Size(320, 276);
 
 
 
@@ -1340,7 +840,7 @@ ApplySettingsToHud();
 
 
 
-steamReader = new SteamDirectProfitReader();
+steamReader = new SteamWebProfitReader(49513, 0);
 
 
 
@@ -1850,6 +1350,29 @@ this.Controls.Add(pnlPreview);
 
 this.Controls.Add(grpControls);
 
+        Button btnSteamLogin = new Button();
+        btnSteamLogin.Text = "🌐 스팀 로그인 (우클릭: 계정변경)";
+        btnSteamLogin.Font = new Font("맑은 고딕", 9f, FontStyle.Bold);
+        btnSteamLogin.BackColor = Color.FromArgb(31, 110, 165);
+        btnSteamLogin.ForeColor = Color.White;
+        btnSteamLogin.FlatStyle = FlatStyle.Flat;
+        btnSteamLogin.FlatAppearance.BorderSize = 0;
+        btnSteamLogin.Size = new Size(292, 32);
+        btnSteamLogin.Location = new Point(14, 216);
+        btnSteamLogin.Cursor = Cursors.Hand;
+        btnSteamLogin.MouseDown += (s, me) => {
+            if (me.Button == MouseButtons.Right) {
+                if (MessageBox.Show("스팀 계정을 다른 아이디로 변경하시겠습니까?\n(기존 로그인 정보가 초기화됩니다)", "계정 변경", MessageBoxButtons.YesNo) == DialogResult.Yes) {
+                    SteamWebProfitReader.ResetSteamLogin();
+                }
+            } else {
+                SteamWebProfitReader.LaunchEdgeApp(true);
+            }
+        };
+        this.Controls.Add(btnSteamLogin);
+        btnSteamLogin.BringToFront();
+        
+
 
 
 Label lblCredit = new Label()
@@ -1872,7 +1395,7 @@ ForeColor = Color.FromArgb(255, 238, 140),
 
 
 
-Location = new Point(14, 214),
+Location = new Point(14, 252),
 
 
 
