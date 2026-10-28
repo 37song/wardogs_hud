@@ -1,4 +1,4 @@
-# WARDOGS 수익 HUD (Profit HUD) v1.0.0
+# WARDOGS_PROFIT_HUD v1.0.0
 
 [![Release](https://img.shields.io/github/v/release/37song/wardogs_hud?color=brightgreen)](https://github.com/37song/wardogs_hud/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -16,7 +16,7 @@
 1. **🌐 원클릭 스팀 내장 연동 (단일 인스턴스 보장)**
    - 더 이상 브라우저 콘솔창(F12)에 코드를 복사하거나 북마크를 누를 필요가 없습니다.
    - 프로그램 우측 상단의 `[🌐 스팀 로그인]` 버튼을 누르면 나타나는 가벼운 창에서 Steam 1회 로그인만 완료하면 실시간 손익이 HUD에 즉시 표시됩니다.
-   - 단일 인스턴스 방어 기능이 내장되어 있어 권한 팝업을 늦게 누르거나 버튼을 여러 번 눌러도 **채팅창이 중복해서 여러 개 켜지지 않고 항상 1개만 깔끔하게 유지**됩니다.
+   - 단일 인스턴스 방어 기능이 내장되어 있어 버튼을 여러 번 눌러도 **채팅창이 중복해서 여러 개 켜지지 않고 항상 1개만 깔끔하게 유지**됩니다.
 2. **🛡️ 밸브(Valve) 공식 CSP & PNA 완벽 대응**
    - Steam Web Chat의 Content Security Policy(CSP) 규격을 준수하는 공식 로컬 통신 포트(`127.0.0.1:27060`) 및 PNA 자동 통과 플래그를 탑재하여 외부 유출 없는 100% 로컬 보안 통신을 보장합니다.
 3. **🔄 스마트 세션 자동 복구 (Keep-Alive 와치독)**
@@ -34,12 +34,14 @@
 ## 🚀 빠른 시작 (사용 방법)
 
 1. [최신 Releases](https://github.com/37song/wardogs_hud/releases)에서 `WARDOGS_PROFIT_HUD.zip`을 다운로드하고 압축을 풉니다.
-2. `WARDOGS 수익 HUD.exe`를 실행합니다.
+2. `WARDOGS_PROFIT_HUD.exe`를 실행합니다.
 3. 프로그램 상단의 **`[🌐 스팀 로그인]`** 버튼을 클릭합니다.
 4. 열리는 창에서 본인의 Steam 계정으로 로그인합니다.
 5. 로그인이 완료되면 상단 상태바에 실시간 손익이 표시되며, 게임 내에서도 오버레이로 즉시 확인할 수 있습니다!
 
 > **팁**: 계정을 변경하고 싶을 때는 `[🌐 스팀 로그인]` 버튼을 **우클릭**하세요.
+
+---
 
 ## ☕ 후원하기 (Support & Donate)
 
@@ -54,11 +56,15 @@
 <br>
 
 ### 💛 카카오페이 후원 (국내 송금)
+- **스마트폰 사용자**: **[📱 카카오페이 송금 바로가기](https://qr.kakaopay.com/Ej7jxWIW1)** (터치 시 카카오톡 송금창으로 이동)
 
+<details>
+<summary><b>👉 [PC 사용자] 카카오페이 송금 QR코드 보기 (클릭하여 펼치기)</b></summary>
+<br>
 <img src="./.github/kakaopay_qr.png" width="160" alt="카카오페이 송금 QR코드" />
-
-* **PC 사용자**: 스마트폰 카메라 앱 또는 카카오톡으로 위 **QR코드를 스캔**하시면 즉시 송금 화면이 열립니다.
-* **스마트폰 사용자**: **[📱 카카오페이 송금 바로가기](https://qr.kakaopay.com/Ej7jxWIW1)** 터치 시 카카오톡 송금창으로 바로 이동합니다.
+<br>
+스마트폰 카메라 앱 또는 카카오톡으로 위 QR코드를 스캔하시면 즉시 송금 화면이 열립니다.
+</details>
 
 ---
 
