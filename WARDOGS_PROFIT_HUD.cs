@@ -611,51 +611,30 @@ public class SteamWebProfitReader : IDisposable
 
 
             string contentJs = "(function() {\n" +
-
                 "  const S = \"#friendslist-container > div > div.chat_main_flex.displayRow.Panel.Focusable > div.DropTarget.friendsListContainer.fullheight.Panel.Focusable > div > div.friendListHeaderContainer.titleBarContainer > div.currentUserContainer.ingame > div > div.labelHolder.ingame > div._9lhfreYH7b4- > div:nth-child(2)\";\n" +
-
                 "  function findProfit() {\n" +
-
                 "    let el = document.querySelector(S);\n" +
-
                 "    if (el && el.innerText && el.innerText.trim()) { return el.innerText.trim(); }\n" +
-
                 "    const userBox = document.querySelector('.currentUserContainer.ingame') || document.querySelector('.currentUserContainer');\n" +
-
                 "    if (userBox) {\n" +
-
                 "      const divs = userBox.querySelectorAll('div, span');\n" +
-
                 "      for (let i = 0; i < divs.length; i++) {\n" +
-
                 "        const t = (divs[i].innerText || '').trim();\n" +
-
                 "        if (/^[+-]?\\s*\\$?[\\d,]+/.test(t)) { return t; }\n" +
-
                 "      }\n" +
-
                 "    }\n" +
-
                 "    return '';\n" +
-
                 "  }\n" +
-
                 "  function sync() {\n" +
-
                 "    let txt = findProfit();\n" +
-
-                "    let port = 27060;\n" +
-
-                "    let url = 'http://127.0.0.1:' + port + '/profit/?val=' + encodeURIComponent(txt) + '&st=game';\n" +
-
-                "    fetch(url, { mode: 'no-cors' }).catch(function(){});\n" +
-
+                "    const ports = [27060, 49512, 49513];\n" +
+                "    for (let i = 0; i < ports.length; i++) {\n" +
+                "      let url = 'http://127.0.0.1:' + ports[i] + '/profit/?val=' + encodeURIComponent(txt) + '&st=game';\n" +
+                "      fetch(url, { mode: 'no-cors' }).catch(function(){});\n" +
+                "    }\n" +
                 "  }\n" +
-
                 "  setInterval(sync, 1000);\n" +
-
                 "  sync();\n" +
-
                 "})();";
 
 
@@ -675,65 +654,36 @@ public class SteamWebProfitReader : IDisposable
 
 
     public static bool IsEdgeAppRunning()
-
     {
-
         try
-
         {
-
             if (_edgeProcess != null && !_edgeProcess.HasExited)
-
             {
-
                 return true;
-
             }
-
-
 
             using (var searcher = new System.Management.ManagementObjectSearcher(
-
                 "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name = 'msedge.exe'"))
-
             {
-
                 foreach (System.Management.ManagementObject obj in searcher.Get())
-
                 {
-
                     object cmdObj = obj["CommandLine"];
-
                     if (cmdObj != null)
-
                     {
-
                         string cmd = cmdObj.ToString();
-
-                        if (cmd.IndexOf("WardogsSteamProfile", StringComparison.OrdinalIgnoreCase) >= 0)
-
+                        if (cmd.IndexOf("WardogsSteamProfile", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                            cmd.IndexOf("--type=", StringComparison.OrdinalIgnoreCase) < 0)
                         {
-
                             int pid = Convert.ToInt32(obj["ProcessId"]);
-
                             try { _edgeProcess = System.Diagnostics.Process.GetProcessById(pid); } catch { }
-
                             return true;
-
                         }
-
                     }
-
                 }
-
             }
-
         }
-
         catch { }
-
         return false;
-
     }
 
 
@@ -857,67 +807,35 @@ public class SteamWebProfitReader : IDisposable
 
 
     public static void LaunchEdgeApp(bool showNormalWindow)
-
     {
-
         try
-
         {
-
-            // Single Instance Guard: If already running, do NOT launch another one!
-
             if (IsEdgeAppRunning())
-
             {
-
                 if (showNormalWindow)
-
                 {
-
                     FocusExistingEdgeApp();
-
                 }
-
                 return;
-
             }
 
-
-
+            KillExistingEdgeApp();
             EnsureExtensionFiles();
-
             string edge = FindEdgeExe();
-
             string profile = ProfileDir;
-
             string ext = ExtensionDir;
 
-
-
-            // Flags prevent "Allow access to other apps" (PNA prompt) popup:
-
             string args = string.Format(
-
-                "--user-data-dir=\"{0}\" --load-extension=\"{1}\" --no-first-run --no-default-browser-check --app=https://steamcommunity.com/chat",
-
+                "--user-data-dir=\"{0}\" --load-extension=\"{1}\" --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --app=https://steamcommunity.com/chat",
                 profile, ext
-
             );
 
-
-
             var psi = new System.Diagnostics.ProcessStartInfo(edge, args);
-
             psi.WindowStyle = showNormalWindow ? System.Diagnostics.ProcessWindowStyle.Normal : System.Diagnostics.ProcessWindowStyle.Minimized;
 
-
-
             _edgeProcess = System.Diagnostics.Process.Start(psi);
-
         }
-
         catch { }
-
     }
 
 
@@ -926,41 +844,29 @@ public class SteamWebProfitReader : IDisposable
     {
         try
         {
-            // 1. Force kill all Edge processes using WardogsSteamProfile
             KillExistingEdgeApp();
             System.Threading.Thread.Sleep(500);
 
-            // 2. Clear ONLY cookies and session data from Default folder
-            // Preserves site permissions (e.g. Private Network Access: Allow) and extension config
             string profile = ProfileDir;
             string defaultDir = System.IO.Path.Combine(profile, "Default");
-            if (System.IO.Directory.Exists(defaultDir))
+            for (int r = 0; r < 5; r++)
             {
-                string[] subDirsToClean = new string[] {
-                    "Network",
-                    "Sessions",
-                    "EdgeSessions",
-                    "Local Storage",
-                    "Session Storage",
-                    "IndexedDB"
-                };
-                foreach (var sub in subDirsToClean)
+                if (!System.IO.Directory.Exists(defaultDir)) break;
+                try
                 {
-                    string target = System.IO.Path.Combine(defaultDir, sub);
-                    try
-                    {
-                        if (System.IO.Directory.Exists(target))
-                        {
-                            System.IO.Directory.Delete(target, true);
-                        }
-                    }
-                    catch { }
+                    System.IO.Directory.Delete(defaultDir, true);
+                    break;
+                }
+                catch
+                {
+                    KillExistingEdgeApp();
+                    System.Threading.Thread.Sleep(300);
                 }
             }
 
             System.Windows.Forms.MessageBox.Show(
-                "스팀 로그인 세션이 초기화되었습니다.\n열리는 창에서 새로운 스팀 계정으로 로그인해 주세요.",
-                "계정 변경 안내",
+                "스팀 로그인 정보와 브라우저 권한 설정이 완전히 초기화되었습니다.\n열리는 창에서 로그인 후 나타나는 팝업에서 [허용]을 눌러주세요.",
+                "초기화 완료",
                 System.Windows.Forms.MessageBoxButtons.OK,
                 System.Windows.Forms.MessageBoxIcon.Information
             );
@@ -1042,99 +948,49 @@ public class SteamWebProfitReader : IDisposable
 
 
     private void WatchdogLoop()
-
     {
-
         while (_running)
-
         {
-
-            System.Threading.Thread.Sleep(15000);
-
+            System.Threading.Thread.Sleep(5000);
             if (!_running) break;
 
-
-
-            // Absolute Single Instance Guard:
-
-            // NEVER launch if Edge is already running (whether user is logging in, or pending prompt)
-
-            if (IsEdgeAppRunning())
-
-                continue;
-
-
-
-            // Only auto-restore if user has successfully connected before (logged in),
-
-            // and no data received for 30s, and Edge is completely closed!
-
-            if (_hasReceivedAnyData && (DateTime.Now - _lastReceived).TotalSeconds > 30)
-
+            if (!IsEdgeAppRunning())
             {
-
-                LaunchEdgeApp(false);
-
+                if (_hasReceivedAnyData && (DateTime.Now - _lastReceived).TotalSeconds > 15)
+                {
+                    LaunchEdgeApp(false);
+                }
             }
-
         }
-
     }
 
 
 
     private void StartListener()
-
     {
-
-        int[] portsToTry;
-
-        if (_primaryPort == 27060)
-
-            portsToTry = new int[] { 27060, 49512, 49513 };
-
-        else
-
-            portsToTry = new int[] { _primaryPort, 27060, 49513, 49512 };
-
-
-
-        foreach (int p in portsToTry)
-
+        int[] portsToTry = new int[] { 27060, 49512, 49513 };
+        for (int retry = 0; retry < 3; retry++)
         {
-
-            try
-
+            foreach (int p in portsToTry)
             {
-
-                var l = new System.Net.HttpListener();
-
-                l.Prefixes.Add(string.Format("http://127.0.0.1:{0}/", p));
-
-                l.Prefixes.Add(string.Format("http://127.0.0.1:{0}/profit/", p));
-
-                l.Start();
-
-                _listener = l;
-
-                _running = true;
-
-                _listenThread = new System.Threading.Thread(ListenLoop);
-
-                _listenThread.IsBackground = true;
-
-                _listenThread.Name = "SteamWebProfitReader_" + p;
-
-                _listenThread.Start();
-
-                break;
-
+                try
+                {
+                    var l = new System.Net.HttpListener();
+                    l.Prefixes.Add(string.Format("http://127.0.0.1:{0}/", p));
+                    l.Prefixes.Add(string.Format("http://127.0.0.1:{0}/profit/", p));
+                    l.Start();
+                    _listener = l;
+                    _running = true;
+                    _listenThread = new System.Threading.Thread(ListenLoop);
+                    _listenThread.IsBackground = true;
+                    _listenThread.Name = "SteamWebProfitReader_" + p;
+                    _listenThread.Start();
+                    return;
+                }
+                catch { }
             }
-
-            catch { }
-
+            System.Threading.Thread.Sleep(300);
         }
-
     }
 
 
@@ -1240,19 +1096,15 @@ public class SteamWebProfitReader : IDisposable
 
 
             lock (_lock)
-
             {
-
-                _curVal = cleanVal;
-
-                _curState = st;
-
-                _curFaction = fac;
-
+                if (!string.IsNullOrEmpty(cleanVal))
+                {
+                    _curVal = cleanVal;
+                    _curState = st;
+                    _curFaction = fac;
+                }
                 _lastReceived = DateTime.Now;
-
                 _hasReceivedAnyData = true;
-
             }
 
 
@@ -1291,7 +1143,7 @@ public class SteamWebProfitReader : IDisposable
 
 
 
-            if ((DateTime.Now - _lastReceived).TotalSeconds <= 12)
+            if ((DateTime.Now - _lastReceived).TotalSeconds <= 30)
 
             {
 
