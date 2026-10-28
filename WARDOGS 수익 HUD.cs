@@ -964,20 +964,8 @@ IsWardogsRunning = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Le
                 addr = nextAddr;
             }
 
-            bool matchIsNewer = false;
+            // If a valid profit_loss match packet was found for our SteamID, it ALWAYS takes priority over stale lobby remnants!
             if (latestMatchAddr > 0 && !string.IsNullOrEmpty(latestMatchVal))
-            {
-                if (maxMatchTs > 0 || maxIdleTs > 0)
-                {
-                    matchIsNewer = (maxMatchTs > maxIdleTs) || (maxMatchTs == maxIdleTs && latestMatchAddr >= latestIdleAddr);
-                }
-                else
-                {
-                    matchIsNewer = latestIdleAddr == 0 || latestMatchAddr >= latestIdleAddr;
-                }
-            }
-
-            if (matchIsNewer && latestMatchAddr > 0 && !string.IsNullOrEmpty(latestMatchVal))
             {
                 foundAddr = latestMatchAddr;
                 val = latestMatchVal;
