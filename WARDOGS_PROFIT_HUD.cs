@@ -452,7 +452,7 @@ public class SteamWebProfitReader : IDisposable
 
             // Flags prevent "Allow access to other apps" (PNA prompt) popup:
             string args = string.Format(
-                "--user-data-dir=\"{0}\" --load-extension=\"{1}\" --no-first-run --no-default-browser-check --disable-features=BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessSendPreflights --unsafely-treat-insecure-origin-as-secure=http://127.0.0.1:27060 --app=https://steamcommunity.com/chat",
+                "--user-data-dir=\"{0}\" --load-extension=\"{1}\" --no-first-run --no-default-browser-check --app=https://steamcommunity.com/chat",
                 profile, ext
             );
 
