@@ -606,6 +606,26 @@ IsWardogsRunning = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Le
 
 
 
+                private static ulong ExtractOwnerSteamId(byte[] buf, int needlePos)
+        {
+            int start = Math.Max(0, needlePos - 300);
+            for (int j = needlePos - 12; j >= start; j--)
+            {
+                if (buf[j] == 0x09 && buf[j + 9] == 0x10 && buf[j + 10] == 0x01 && buf[j + 11] == 0x18)
+                {
+                    return BitConverter.ToUInt64(buf, j + 1);
+                }
+            }
+            for (int j = needlePos - 8; j >= start; j--)
+            {
+                if (buf[j + 4] == 0x01 && buf[j + 5] == 0x00 && buf[j + 6] == 0x10 && buf[j + 7] == 0x01)
+                {
+                    return BitConverter.ToUInt64(buf, j);
+                }
+            }
+            return 0UL;
+        }
+
         private void WorkerLoop()
         {
             int steamPid = 0;
@@ -688,35 +708,45 @@ IsWardogsRunning = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Le
                         cachedAddr = 0;
                     }
 
-                    // 1. Cached fast read (0.01ms)
+                    // 1. Cached fast read (0.01ms) with owner verification
                     if (cachedAddr > 0)
                     {
                         IntPtr nRead;
-                        if (ReadProcessMemory(hProc, (IntPtr)cachedAddr, pageBuf, 256, out nRead) && (int)nRead > 64)
+                        long readStart = Math.Max(0, cachedAddr - 250);
+                        int readOffset = (int)(cachedAddr - readStart);
+                        if (ReadProcessMemory(hProc, (IntPtr)readStart, pageBuf, 512, out nRead) && (int)nRead > readOffset + 64)
                         {
-                            string body = Encoding.ASCII.GetString(pageBuf, 0, (int)nRead);
-                            Match mp = Regex.Match(body, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
-                            if (mp.Success && !body.Contains("match_lost"))
+                            ulong cacheOwner = ExtractOwnerSteamId(pageBuf, readOffset);
+                            if (steamId64 != 0 && cacheOwner != steamId64)
                             {
-                                val = mp.Groups[1].Value.Replace(" ", "");
-                                Match mst = Regex.Match(body, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                if (mst.Success) state = mst.Groups[1].Value.ToLowerInvariant();
-                                else state = val.Contains("-") ? "loss" : "profit";
-                                inGame = true;
-                                ok = true;
-                            }
-                            else if (body.Contains("#Status_Frontend") || body.Contains("#Status_ShootingRange"))
-                            {
-                                state = body.Contains("#Status_ShootingRange") ? "shootingrange" : "frontend";
-                                inGame = false;
-                                val = "";
-                                ok = true;
+                                // Invalidate cache immediately if not strictly matching our SteamID64!
                                 cachedAddr = 0;
                             }
                             else
                             {
-                                // Cache miss/data shifted -> trigger full scan below without declaring frontend
-                                cachedAddr = 0;
+                                string body = Encoding.ASCII.GetString(pageBuf, readOffset, (int)nRead - readOffset);
+                                Match mp = Regex.Match(body, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
+                                if (mp.Success && !body.Contains("match_lost"))
+                                {
+                                    val = mp.Groups[1].Value.Replace(" ", "");
+                                    Match mst = Regex.Match(body, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+                                    if (mst.Success) state = mst.Groups[1].Value.ToLowerInvariant();
+                                    else state = val.Contains("-") ? "loss" : "profit";
+                                    inGame = true;
+                                    ok = true;
+                                }
+                                else if (body.Contains("#Status_Frontend") || body.Contains("#Status_ShootingRange"))
+                                {
+                                    state = body.Contains("#Status_ShootingRange") ? "shootingrange" : "frontend";
+                                    inGame = false;
+                                    val = "";
+                                    ok = true;
+                                    cachedAddr = 0;
+                                }
+                                else
+                                {
+                                    cachedAddr = 0;
+                                }
                             }
                         }
                         else
@@ -725,7 +755,7 @@ IsWardogsRunning = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Le
                         }
                     }
 
-                    // 2. Full scan for steam_display (tracks real-time status transitions)
+                    // 2. Full scan for steam_display with strict owner verification
                     if (!ok)
                     {
                         long scanStart = 0x10000000000L;
@@ -745,7 +775,7 @@ IsWardogsRunning = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Le
                     {
                         if (inGame && !string.IsNullOrEmpty(val))
                         {
-                            // In-game match data actively confirmed
+                            // In-game match data actively confirmed for current user
                             curVal = val;
                             curState = state;
                             hasData = true;
@@ -754,18 +784,15 @@ IsWardogsRunning = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Le
                         }
                         else if (ok && (state == "frontend" || state == "shootingrange"))
                         {
-                            // Lobby packet observed
+                            // Lobby packet observed for current user
                             if (hasData && IsWardogsRunning)
                             {
-                                // We WERE in a match. Don't switch to lobby immediately!
-                                // It could be stale lobby artifact or brief lag. Require 10 consecutive ticks (2.5s) of lobby packets!
                                 if (++lobbyConfirmTicks <= 10)
                                 {
                                     // Hold previous profit value firmly!
                                 }
                                 else
                                 {
-                                    // Truly returned to lobby/menu after 2.5s continuous lobby confirmation
                                     curVal = "";
                                     curState = state;
                                     hasData = false;
@@ -775,7 +802,6 @@ IsWardogsRunning = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Le
                             }
                             else
                             {
-                                // Already in lobby
                                 curVal = "";
                                 curState = state;
                                 hasData = false;
@@ -785,8 +811,6 @@ IsWardogsRunning = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Le
                         }
                         else
                         {
-                            // Packet dropout, GC, or reading gap while Wardogs is still running:
-                            // Reset lobby counter (it is not a confirmed lobby packet) and hold previous profit value for up to 5.0s (20 ticks * 250ms)!
                             lobbyConfirmTicks = 0;
                             if (hasData && IsWardogsRunning && ++missingMatchTicks <= 20)
                             {
@@ -814,9 +838,6 @@ IsWardogsRunning = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Le
         {
             foundAddr = 0; val = ""; state = "none"; inGame = false;
             byte[] needle = Encoding.ASCII.GetBytes("steam_display");
-            byte[] userBytes4 = activeUser != 0 ? BitConverter.GetBytes(activeUser) : null;
-            byte[] userBytes8 = steamId64 != 0 ? BitConverter.GetBytes(steamId64) : null;
-            byte[] localHistTag = new byte[] { 0x7a, 0x04, (byte)'H', (byte)'I', (byte)'S', (byte)'T' };
 
             long latestMatchAddr = 0;
             string latestMatchVal = "";
@@ -859,76 +880,74 @@ IsWardogsRunning = Process.GetProcessesByName("WardogsClient-Win64-Shipping").Le
                                     }
                                     if (match)
                                     {
-                                        int chunkStart = Math.Max(0, i - 400);
-                                        int chunkLen = Math.Min(bytesRead - chunkStart, 750);
-                                        bool isLocal = false;
-                                        if (userBytes8 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes8) != -1) isLocal = true;
-                                        else if (userBytes4 != null && FindBytesSub(pageBuf, chunkStart, chunkLen, userBytes4) != -1) isLocal = true;
-                                        else if (FindBytesSub(pageBuf, chunkStart, chunkLen, localHistTag) != -1) isLocal = true;
-
-                                        if (isLocal)
+                                        // Strict owner verification: Extract owner SteamID64 preceding the packet
+                                        ulong ownerSteamId = ExtractOwnerSteamId(pageBuf, i);
+                                        if (steamId64 != 0 && ownerSteamId != steamId64)
                                         {
-                                            int bodyLen = Math.Min(bytesRead - i, 250);
-                                            string body = Encoding.ASCII.GetString(pageBuf, i, bodyLen);
-                                            Match ms = Regex.Match(body, @"#Status_(\w+)");
-                                            if (ms.Success)
-                                            {
-                                                string st = ms.Groups[1].Value;
+                                            // Packet belongs to a friend (e.g. Steam chat / friends list) or unknown. Skip!
+                                            continue;
+                                        }
 
-                                                // Extract 8-byte Steam Rich Presence sequence ID from lobby header
-                                                ulong ts = 0;
-                                                int lIdx = -1;
-                                                int lStart = Math.Max(0, i - 80);
-                                                for (int j = i - 6; j >= lStart; j--)
+                                        int bodyLen = Math.Min(bytesRead - i, 250);
+                                        string body = Encoding.ASCII.GetString(pageBuf, i, bodyLen);
+                                        Match ms = Regex.Match(body, @"#Status_(\w+)");
+                                        if (ms.Success)
+                                        {
+                                            string st = ms.Groups[1].Value;
+
+                                            // Extract 8-byte Steam Rich Presence sequence ID from lobby header
+                                            ulong ts = 0;
+                                            int lIdx = -1;
+                                            int lStart = Math.Max(0, i - 80);
+                                            for (int j = i - 6; j >= lStart; j--)
+                                            {
+                                                if (pageBuf[j] == 'l' && pageBuf[j + 1] == 'o' && pageBuf[j + 2] == 'b' && pageBuf[j + 3] == 'b' && pageBuf[j + 4] == 'y' && pageBuf[j + 5] == 0)
                                                 {
-                                                    if (pageBuf[j] == 'l' && pageBuf[j + 1] == 'o' && pageBuf[j + 2] == 'b' && pageBuf[j + 3] == 'b' && pageBuf[j + 4] == 'y' && pageBuf[j + 5] == 0)
-                                                    {
-                                                        lIdx = j;
-                                                        break;
-                                                    }
+                                                    lIdx = j;
+                                                    break;
                                                 }
-                                                if (lIdx != -1 && lIdx + 14 <= bytesRead)
-                                                {
-                                                    ts = BitConverter.ToUInt64(pageBuf, lIdx + 6);
-                                                }
+                                            }
+                                            if (lIdx != -1 && lIdx + 14 <= bytesRead)
+                                            {
+                                                ts = BitConverter.ToUInt64(pageBuf, lIdx + 6);
+                                            }
+                                            else
+                                            {
+                                                int tIdx = FindBytesSub(pageBuf, Math.Max(0, i - 120), Math.Min(120, i), new byte[] { 0xf8, 0x02 });
+                                                if (tIdx != -1) ts = DecodeVarint(pageBuf, tIdx + 2);
                                                 else
                                                 {
-                                                    int tIdx = FindBytesSub(pageBuf, Math.Max(0, i - 120), Math.Min(120, i), new byte[] { 0xf8, 0x02 });
+                                                    tIdx = FindBytesSub(pageBuf, Math.Max(0, i - 120), Math.Min(120, i), new byte[] { 0xe8, 0x02 });
                                                     if (tIdx != -1) ts = DecodeVarint(pageBuf, tIdx + 2);
-                                                    else
-                                                    {
-                                                        tIdx = FindBytesSub(pageBuf, Math.Max(0, i - 120), Math.Min(120, i), new byte[] { 0xe8, 0x02 });
-                                                        if (tIdx != -1) ts = DecodeVarint(pageBuf, tIdx + 2);
-                                                    }
                                                 }
+                                            }
 
-                                                // If packet contains profit_loss, it is unconditionally an in-match packet!
-                                                Match mp = Regex.Match(body, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
-                                                if (mp.Success && !body.Contains("match_lost"))
+                                            // If packet contains profit_loss, it is unconditionally an in-match packet!
+                                            Match mp = Regex.Match(body, @"profit_loss[^\$\+\-\d]*([\+\-]?\s*\$[\d,]+)");
+                                            if (mp.Success && !body.Contains("match_lost"))
+                                            {
+                                                string pVal = mp.Groups[1].Value.Replace(" ", "");
+                                                string pState;
+                                                Match mst = Regex.Match(body, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
+                                                if (mst.Success) pState = mst.Groups[1].Value.ToLowerInvariant();
+                                                else pState = pVal.Contains("-") ? "loss" : "profit";
+
+                                                bool isNewerMatch = (ts > maxMatchTs) || (ts == maxMatchTs && (baseAddr + offset + i) > latestMatchAddr);
+                                                if (isNewerMatch)
                                                 {
-                                                    string pVal = mp.Groups[1].Value.Replace(" ", "");
-                                                    string pState;
-                                                    Match mst = Regex.Match(body, @"in_profit_or_loss[^\w]*(loss|profit)", RegexOptions.IgnoreCase);
-                                                    if (mst.Success) pState = mst.Groups[1].Value.ToLowerInvariant();
-                                                    else pState = pVal.Contains("-") ? "loss" : "profit";
-
-                                                    bool isNewerMatch = (ts > maxMatchTs) || (ts == maxMatchTs && (baseAddr + offset + i) > latestMatchAddr);
-                                                    if (isNewerMatch)
-                                                    {
-                                                        maxMatchTs = ts;
-                                                        latestMatchAddr = baseAddr + offset + i;
-                                                        latestMatchVal = pVal;
-                                                        latestMatchState = pState;
-                                                    }
+                                                    maxMatchTs = ts;
+                                                    latestMatchAddr = baseAddr + offset + i;
+                                                    latestMatchVal = pVal;
+                                                    latestMatchState = pState;
                                                 }
-                                                else if (st == "Frontend" || st == "ShootingRange")
+                                            }
+                                            else if (st == "Frontend" || st == "ShootingRange")
+                                            {
+                                                bool isNewerIdle = (ts > maxIdleTs) || (ts == maxIdleTs && (baseAddr + offset + i) > latestIdleAddr);
+                                                if (isNewerIdle)
                                                 {
-                                                    bool isNewerIdle = (ts > maxIdleTs) || (ts == maxIdleTs && (baseAddr + offset + i) > latestIdleAddr);
-                                                    if (isNewerIdle)
-                                                    {
-                                                        maxIdleTs = ts;
-                                                        latestIdleAddr = baseAddr + offset + i;
-                                                    }
+                                                    maxIdleTs = ts;
+                                                    latestIdleAddr = baseAddr + offset + i;
                                                 }
                                             }
                                         }
